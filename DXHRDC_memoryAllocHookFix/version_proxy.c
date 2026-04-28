@@ -129,12 +129,13 @@ static const char *g_procNames[FN_COUNT] = {
 
 static void LoadRealVersionDLL(void)
 {
-	char path[MAX_PATH];
-	GetSystemDirectoryA(path, MAX_PATH);
-	lstrcatA(path, "\\version.dll");
-	g_realVersion = LoadLibraryA(path);
+	wchar_t path[MAX_PATH];
+	GetSystemDirectoryW(path, MAX_PATH);
+	lstrcatW(path, L"\\version.dll");
+	g_realVersion = LoadLibraryW(path);
 	if (!g_realVersion)
 		return;
+	/* GetProcAddress always uses ANSI names (by Windows design) */
 	for (int i = 0; i < FN_COUNT; i++)
 		g_procs[i] = GetProcAddress(g_realVersion, g_procNames[i]);
 }
@@ -276,7 +277,7 @@ static void Log(const char *fmt, ...)
 	char buf[2048];
 	va_list ap;
 	va_start(ap, fmt);
-	int n = _vsnprintf_s(buf, 2048, sizeof(buf) - 1, fmt, ap);
+	int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
 	va_end(ap);
 	if (n <= 0)
 		return;
@@ -326,31 +327,29 @@ static void Log(const char *fmt, ...)
 static void GetModuleForAddress(DWORD addr, char *outBuf, int bufSize)
 {
 	HMODULE hMod = NULL;
-	if (GetModuleHandleExA(
+	if (GetModuleHandleExW(
 					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
 							GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-					(LPCSTR)(DWORD_PTR)addr, &hMod))
+					(LPCWSTR)(DWORD_PTR)addr, &hMod))
 	{
-		char modPath[MAX_PATH];
-		if (GetModuleFileNameA(hMod, modPath, MAX_PATH))
+		wchar_t modPath[MAX_PATH];
+		if (GetModuleFileNameW(hMod, modPath, MAX_PATH))
 		{
 			/* Extract just the filename from the full path */
-			const char *name = modPath;
-			const char *p = modPath;
+			const wchar_t *name = modPath;
+			const wchar_t *p = modPath;
 			while (*p)
 			{
-				if (*p == '\\' || *p == '/')
+				if (*p == L'\\' || *p == L'/')
 					name = p + 1;
 				p++;
 			}
 			DWORD offset = addr - (DWORD)(DWORD_PTR)hMod;
-			_snprintf_s(outBuf, bufSize, bufSize, "%s+0x%X", name, offset);
-			outBuf[bufSize - 1] = 0;
+			_snprintf_s(outBuf, bufSize, _TRUNCATE, "%ls+0x%X", name, offset);
 			return;
 		}
 	}
-	_snprintf_s(outBuf, bufSize, bufSize, "unknown");
-	outBuf[bufSize - 1] = 0;
+	_snprintf_s(outBuf, bufSize, _TRUNCATE, "unknown");
 }
 
 static void LogStackTrace(int skipFrames)
@@ -474,8 +473,7 @@ static void __cdecl Hook_GamePrintError(const char *fmt, ...)
 	char buf[1024];
 	va_list ap;
 	va_start(ap, fmt);
-	_vsnprintf_s(buf, 1024, sizeof(buf) - 1, fmt, ap);
-	buf[sizeof(buf) - 1] = 0;
+	_vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
 	va_end(ap);
 
 	if (g_suppressOOM)
@@ -871,10 +869,11 @@ static void __fastcall Hook_DynArrayPushBack(void *this_, void *edx_,
 static void LogBytes(const char *label, BYTE *addr, int n)
 {
 	char line[256];
-	int pos = sprintf_s(line, 256, "[MEMFIX] %s 0x%08X:", label, (unsigned)(DWORD_PTR)addr);
+	int pos = sprintf_s(line, sizeof(line), "[MEMFIX] %s 0x%08X:",
+											label, (unsigned)(DWORD_PTR)addr);
 	for (int i = 0; i < n && i < 16; i++)
-		pos += sprintf_s(line + pos, 256 - pos, " %02X", addr[i]);
-	strcat_s(line, 256, "\r\n");
+		pos += sprintf_s(line + pos, sizeof(line) - pos, " %02X", addr[i]);
+	strcat_s(line, sizeof(line), "\r\n");
 	Log("%s", line);
 }
 
@@ -1119,17 +1118,17 @@ static BOOL InstallAllHooks(void)
 		HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
 		if (snap != INVALID_HANDLE_VALUE)
 		{
-			MODULEENTRY32 me;
+			MODULEENTRY32W me;
 			me.dwSize = sizeof(me);
-			if (Module32First(snap, &me))
+			if (Module32FirstW(snap, &me))
 			{
 				do
 				{
-					Log("[MEMFIX]   0x%08X - 0x%08X  %S\r\n",
+					Log("[MEMFIX]   0x%08X - 0x%08X  %ls\r\n",
 							(unsigned)(DWORD_PTR)me.modBaseAddr,
 							(unsigned)((DWORD_PTR)me.modBaseAddr + me.modBaseSize),
 							me.szModule);
-				} while (Module32Next(snap, &me));
+				} while (Module32NextW(snap, &me));
 			}
 			CloseHandle(snap);
 		}
