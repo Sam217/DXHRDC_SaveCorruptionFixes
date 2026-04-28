@@ -379,53 +379,7 @@ static void LogStackTrace(int skipFrames)
 					(unsigned)i, addr, modInfo);
 		}
 	}
-
-	/* If CaptureStackBackTrace gave us fewer than 4 frames,
-	 * try manual EBP chain walk to get deeper into game code.
-	 * With /Oy- on our DLL, our frames have proper EBP chains,
-	 * but the walk may still stop at game code with FPO. */
-	if (captured < 4)
-	{
-		DWORD ebpVal;
-		__asm { mov ebpVal, ebp } /* read current EBP register */
-
-		/* Validate we got something reasonable */
-		if (ebpVal != 0 && (ebpVal & 0x3) == 0 && ebpVal > 0x10000)
-		{
-			Log("[MEMFIX]   EBP chain walk (manual):\r\n");
-			DWORD frame = ebpVal;
-			for (int i = 0; i < 16; i++)
-			{
-				if (frame == 0 || (frame & 0x3) != 0 ||
-						frame < 0x10000 || frame > 0x7FFE0000)
-					break;
-				if (IsBadReadPtr((void *)frame, 8))
-					break;
-
-				DWORD retAddr = *(DWORD *)(frame + 4);
-				DWORD prevFrame = *(DWORD *)frame;
-
-				if (retAddr == 0)
-					break;
-
-				if (retAddr >= baseAddr && retAddr < exeMax)
-				{
-					Log("[MEMFIX]     EBP #%d: 0x%08X  (EXE RVA 0x%08X)\r\n",
-							i, retAddr, retAddr - baseAddr);
-				} else
-				{
-					char modInfo[256];
-					GetModuleForAddress(retAddr, modInfo, sizeof(modInfo));
-					Log("[MEMFIX]     EBP #%d: 0x%08X  (%s)\r\n",
-							i, retAddr, modInfo);
-				}
-
-				if (prevFrame <= frame)
-					break;
-				frame = prevFrame;
-			}
-		}
-	}
+}
 }
 
 /* ================================================================
@@ -910,6 +864,73 @@ static void __fastcall Hook_DynArrayPushBack(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9d. HOOK 7 — DynArray4_PushBack (4-byte element variant)
+ *
+ * RVA 0x0014ec40   __thiscall   void (undefined4* element)
+ *
+ * CONFIRMED crash source: Hud::LoadActiveGroups reads from a
+ * corrupted save stream in a while-loop until it hits a 0 terminator.
+ * If the terminator is missing, it loops millions of times, pushing
+ * into this DynArray via DynArray4_PushBack (4 bytes per element).
+ *
+ * Same doubling pattern as DynArray_PushBack_8bytes, but allocates
+ * new_capacity * 4 instead of * 8.
+ *
+ * DynArray layout: this[0]=count, this[1]=capacity, this[2]=buffer
+ *
+ * Prologue (5 bytes stolen):
+ *   0014ec40  56            PUSH ESI
+ *   0014ec41  8B F1         MOV ESI, ECX
+ *   0014ec43  8B 0E         MOV ECX, [ESI]
+ *
+ * Returns via RET 0x4 (callee cleans 1 stack arg).
+ * ================================================================ */
+
+#define RVA_PUSHBACK4 0x0014ec40
+#define STEAL_PUSHBACK4 5
+
+static HookCtx g_hkPushBack4;
+static volatile LONG g_pushback4Warnings = 0;
+
+typedef void(__fastcall *OrigPushBack4_t)(void *, void *, void *);
+
+static void __fastcall Hook_DynArray4PushBack(void *this_, void *edx_,
+																							void *element)
+{
+	unsigned int *arr = (unsigned int *)this_;
+	unsigned int count = arr[0];
+
+	if (count >= MAX_DYNARRAY_ELEMENTS)
+	{
+		LONG warned = InterlockedIncrement(&g_pushback4Warnings);
+		if (warned <= 5)
+		{
+			void *caller = NULL;
+			CaptureStackBackTrace(1, 1, &caller, NULL);
+
+			BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+			DWORD callerAddr = (DWORD)(DWORD_PTR)caller;
+			DWORD baseAddr = (DWORD)(DWORD_PTR)base;
+
+			Log("[MEMFIX] *** DynArray4 GROWTH BLOCKED ***\r\n");
+			Log("[MEMFIX]   count=%u (max=%u), capacity=%u\r\n",
+					count, MAX_DYNARRAY_ELEMENTS, arr[1]);
+			Log("[MEMFIX]   caller: 0x%08X (EXE RVA 0x%08X)\r\n",
+					callerAddr, callerAddr - baseAddr);
+
+			if (warned == 5)
+			{
+				Log("[MEMFIX]   (further DynArray4 warnings suppressed)\r\n");
+			}
+		}
+		return; /* refuse the push */
+	}
+
+	OrigPushBack4_t orig = (OrigPushBack4_t)(g_hkPushBack4.trampoline);
+	orig(this_, edx_, element);
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -985,61 +1006,58 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 			(unsigned)ctx->Esi, (unsigned)ctx->Edi,
 			(unsigned)ctx->Ebp, (unsigned)ctx->Esp);
 
-	/* Walk the REAL crash stack using EBP chain from the exception
-	 * context — NOT CaptureStackBackTrace, which only sees the
-	 * exception dispatch chain (ntdll frames), not the game code. */
-	Log("[MEMFIX] Crash call stack (EBP chain walk):\r\n");
+	/* Walk the REAL crash stack by scanning ESP for return addresses.
+	 * EBP chain walking fails here because many game functions
+	 * (compiled with /O2 + FPO) don't use EBP as a frame pointer.
+	 * Instead, we scan upward from ESP looking for values that
+	 * look like code addresses within the EXE's .text section.
+	 * This is the same heuristic VS debugger uses. */
+	Log("[MEMFIX] Crash call stack (stack scan):\r\n");
 	{
-		DWORD ebp = ctx->Ebp;
 		DWORD eip = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
-		DWORD exeMax = baseAddr + 0x02000000;
+		DWORD esp = ctx->Esp;
+		DWORD exeStart = baseAddr;
+		DWORD exeEnd = baseAddr + 0x0067F000; /* approx .text end */
 
-		/* Frame 0 is the crash site itself */
-		if (eip >= baseAddr && eip < exeMax)
+		/* Frame 0: the crash site itself */
+		Log("[MEMFIX]   #0: 0x%08X  (EXE RVA 0x%08X)  *** CRASH ***\r\n",
+				eip, eip - baseAddr);
+
+		/* Scan stack for return addresses.
+		 * A return address is a DWORD on the stack that points into
+		 * the EXE's .text section. Not all matches are real frames
+		 * (some may be old/stale values), but it's the best we can
+		 * do without symbols or .pdata. */
+		int found = 0;
+		for (DWORD scan = esp; scan < esp + 0x400 && found < 20; scan += 4)
 		{
-			Log("[MEMFIX]   #0: 0x%08X  (EXE RVA 0x%08X)  *** CRASH ***\r\n",
-					eip, eip - baseAddr);
-		} else
-		{
-			char modInfo[256];
-			GetModuleForAddress(eip, modInfo, sizeof(modInfo));
-			Log("[MEMFIX]   #0: 0x%08X  (%s)  *** CRASH ***\r\n",
-					eip, modInfo);
+			if (IsBadReadPtr((void *)scan, 4))
+				break;
+
+			DWORD val = *(DWORD *)scan;
+			if (val > exeStart && val < exeEnd)
+			{
+				/* Verify: the byte before this address should be a
+				 * CALL instruction (E8 or FF). This reduces false
+				 * positives from stale stack data. */
+				if (!IsBadReadPtr((void *)(val - 5), 5))
+				{
+					BYTE prev = *(BYTE *)(val - 5);	 /* E8 = CALL rel32 */
+					BYTE prev2 = *(BYTE *)(val - 2); /* FF xx = CALL reg/mem */
+					BYTE prev6 = *(BYTE *)(val - 6); /* FF xx = CALL [reg+disp8] */
+					if (prev == 0xE8 || prev2 == 0xFF || prev6 == 0xFF)
+					{
+						found++;
+						Log("[MEMFIX]   #%d: 0x%08X  (EXE RVA 0x%08X)\r\n",
+								found, val, val - baseAddr);
+					}
+				}
+			}
 		}
 
-		/* Walk EBP chain for remaining frames */
-		for (int i = 1; i < 16; i++)
+		if (found == 0)
 		{
-			/* Validate EBP is readable (aligned, not null, not wild) */
-			if (ebp == 0 || (ebp & 0x3) != 0 || ebp < 0x10000 || ebp > 0x7FFE0000)
-				break;
-
-			/* Safety: check memory is readable */
-			if (IsBadReadPtr((void *)ebp, 8))
-				break;
-
-			DWORD retAddr = *(DWORD *)(ebp + 4); /* return address */
-			DWORD prevEbp = *(DWORD *)ebp;			 /* previous EBP */
-
-			if (retAddr == 0)
-				break;
-
-			if (retAddr >= baseAddr && retAddr < exeMax)
-			{
-				Log("[MEMFIX]   #%d: 0x%08X  (EXE RVA 0x%08X)\r\n",
-						i, retAddr, retAddr - baseAddr);
-			} else
-			{
-				char modInfo[256];
-				GetModuleForAddress(retAddr, modInfo, sizeof(modInfo));
-				Log("[MEMFIX]   #%d: 0x%08X  (%s)\r\n",
-						i, retAddr, modInfo);
-			}
-
-			/* Stack must grow upward — prevent infinite loops */
-			if (prevEbp <= ebp)
-				break;
-			ebp = prevEbp;
+			Log("[MEMFIX]   (no return addresses found on stack)\r\n");
 		}
 	}
 	Log("[MEMFIX] ====================================\r\n");
@@ -1169,11 +1187,9 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
-	/* Hook 6: DynArray_PushBack_8bytes — universal growth cap.
-	 * This is the MAIN safety net.  It catches runaway growth from
-	 * ANY caller, not just LoadFromStream. */
+	/* Hook 6: DynArray_PushBack_8bytes — 8-byte element growth cap */
 	BYTE *pPushBack = base + RVA_PUSHBACK;
-	LogBytes("DynArrayPush   ", pPushBack, 16);
+	LogBytes("DynArrayPush8  ", pPushBack, 16);
 
 	if (pPushBack[0] != 0x56 || pPushBack[1] != 0x8B || pPushBack[2] != 0xF1)
 	{
@@ -1189,7 +1205,35 @@ static BOOL InstallAllHooks(void)
 			Log("[MEMFIX] FAILED to hook DynArray_PushBack\r\n");
 		} else
 		{
-			Log("[MEMFIX] [OK] Hooked DynArray_PushBack"
+			Log("[MEMFIX] [OK] Hooked DynArray_PushBack_8bytes"
+					" (element cap = %u)\r\n",
+					MAX_DYNARRAY_ELEMENTS);
+		}
+	}
+
+	/* Hook 7: DynArray4_PushBack — 4-byte element growth cap.
+	 * THIS is the confirmed crash source (via VS debugger stack trace):
+	 * Hud::LoadActiveGroups → Hud::PushActiveGroup → DynArray4_PushBack
+	 * Corrupt save data causes millions of pushes → doubling → OOM → NULL
+	 * → ArrayCopyElements(NULL,...) → write to 0x4 → AV */
+	BYTE *pPushBack4 = base + RVA_PUSHBACK4;
+	LogBytes("DynArrayPush4  ", pPushBack4, 16);
+
+	if (pPushBack4[0] != 0x56 || pPushBack4[1] != 0x8B || pPushBack4[2] != 0xF1)
+	{
+		Log("[MEMFIX] WARNING: DynArray4_PushBack prologue mismatch! "
+				"Expected 56 8B F1, got %02X %02X %02X\r\n",
+				pPushBack4[0], pPushBack4[1], pPushBack4[2]);
+		Log("[MEMFIX]   Hook 7 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkPushBack4, pPushBack4,
+										 Hook_DynArray4PushBack, STEAL_PUSHBACK4))
+		{
+			Log("[MEMFIX] FAILED to hook DynArray4_PushBack\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked DynArray4_PushBack"
 					" (element cap = %u)\r\n",
 					MAX_DYNARRAY_ELEMENTS);
 		}
@@ -1271,7 +1315,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.5  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.6  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
