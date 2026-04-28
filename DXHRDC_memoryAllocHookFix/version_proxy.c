@@ -379,6 +379,53 @@ static void LogStackTrace(int skipFrames)
 					(unsigned)i, addr, modInfo);
 		}
 	}
+
+	/* If CaptureStackBackTrace gave us fewer than 4 frames,
+	 * try manual EBP chain walk to get deeper into game code.
+	 * With /Oy- on our DLL, our frames have proper EBP chains,
+	 * but the walk may still stop at game code with FPO. */
+	if (captured < 4)
+	{
+		DWORD ebpVal;
+		__asm { mov ebpVal, ebp } /* read current EBP register */
+
+		/* Validate we got something reasonable */
+		if (ebpVal != 0 && (ebpVal & 0x3) == 0 && ebpVal > 0x10000)
+		{
+			Log("[MEMFIX]   EBP chain walk (manual):\r\n");
+			DWORD frame = ebpVal;
+			for (int i = 0; i < 16; i++)
+			{
+				if (frame == 0 || (frame & 0x3) != 0 ||
+						frame < 0x10000 || frame > 0x7FFE0000)
+					break;
+				if (IsBadReadPtr((void *)frame, 8))
+					break;
+
+				DWORD retAddr = *(DWORD *)(frame + 4);
+				DWORD prevFrame = *(DWORD *)frame;
+
+				if (retAddr == 0)
+					break;
+
+				if (retAddr >= baseAddr && retAddr < exeMax)
+				{
+					Log("[MEMFIX]     EBP #%d: 0x%08X  (EXE RVA 0x%08X)\r\n",
+							i, retAddr, retAddr - baseAddr);
+				} else
+				{
+					char modInfo[256];
+					GetModuleForAddress(retAddr, modInfo, sizeof(modInfo));
+					Log("[MEMFIX]     EBP #%d: 0x%08X  (%s)\r\n",
+							i, retAddr, modInfo);
+				}
+
+				if (prevFrame <= frame)
+					break;
+				frame = prevFrame;
+			}
+		}
+	}
 }
 
 /* ================================================================
@@ -938,24 +985,61 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 			(unsigned)ctx->Esi, (unsigned)ctx->Edi,
 			(unsigned)ctx->Ebp, (unsigned)ctx->Esp);
 
-	/* Stack trace */
-	Log("[MEMFIX] Stack trace:\r\n");
-	void *frames[MAX_STACK_FRAMES];
-	USHORT captured = CaptureStackBackTrace(0, MAX_STACK_FRAMES, frames, NULL);
-	DWORD exeMax = baseAddr + 0x02000000;
-	for (USHORT i = 0; i < captured; i++)
+	/* Walk the REAL crash stack using EBP chain from the exception
+	 * context — NOT CaptureStackBackTrace, which only sees the
+	 * exception dispatch chain (ntdll frames), not the game code. */
+	Log("[MEMFIX] Crash call stack (EBP chain walk):\r\n");
 	{
-		DWORD addr = (DWORD)(DWORD_PTR)frames[i];
-		if (addr >= baseAddr && addr < exeMax)
+		DWORD ebp = ctx->Ebp;
+		DWORD eip = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
+		DWORD exeMax = baseAddr + 0x02000000;
+
+		/* Frame 0 is the crash site itself */
+		if (eip >= baseAddr && eip < exeMax)
 		{
-			Log("[MEMFIX]   #%u: 0x%08X  (EXE RVA 0x%08X)\r\n",
-					(unsigned)i, addr, addr - baseAddr);
+			Log("[MEMFIX]   #0: 0x%08X  (EXE RVA 0x%08X)  *** CRASH ***\r\n",
+					eip, eip - baseAddr);
 		} else
 		{
 			char modInfo[256];
-			GetModuleForAddress(addr, modInfo, sizeof(modInfo));
-			Log("[MEMFIX]   #%u: 0x%08X  (%s)\r\n",
-					(unsigned)i, addr, modInfo);
+			GetModuleForAddress(eip, modInfo, sizeof(modInfo));
+			Log("[MEMFIX]   #0: 0x%08X  (%s)  *** CRASH ***\r\n",
+					eip, modInfo);
+		}
+
+		/* Walk EBP chain for remaining frames */
+		for (int i = 1; i < 16; i++)
+		{
+			/* Validate EBP is readable (aligned, not null, not wild) */
+			if (ebp == 0 || (ebp & 0x3) != 0 || ebp < 0x10000 || ebp > 0x7FFE0000)
+				break;
+
+			/* Safety: check memory is readable */
+			if (IsBadReadPtr((void *)ebp, 8))
+				break;
+
+			DWORD retAddr = *(DWORD *)(ebp + 4); /* return address */
+			DWORD prevEbp = *(DWORD *)ebp;			 /* previous EBP */
+
+			if (retAddr == 0)
+				break;
+
+			if (retAddr >= baseAddr && retAddr < exeMax)
+			{
+				Log("[MEMFIX]   #%d: 0x%08X  (EXE RVA 0x%08X)\r\n",
+						i, retAddr, retAddr - baseAddr);
+			} else
+			{
+				char modInfo[256];
+				GetModuleForAddress(retAddr, modInfo, sizeof(modInfo));
+				Log("[MEMFIX]   #%d: 0x%08X  (%s)\r\n",
+						i, retAddr, modInfo);
+			}
+
+			/* Stack must grow upward — prevent infinite loops */
+			if (prevEbp <= ebp)
+				break;
+			ebp = prevEbp;
 		}
 	}
 	Log("[MEMFIX] ====================================\r\n");
@@ -1187,7 +1271,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.4  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.5  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
