@@ -70,6 +70,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <tlhelp32.h>
 #include <windows.h>
 
 /* ================================================================
@@ -321,6 +322,37 @@ static void Log(const char *fmt, ...)
 
 #define MAX_STACK_FRAMES 12
 
+/* Resolve an address to its containing module name + offset */
+static void GetModuleForAddress(DWORD addr, char *outBuf, int bufSize)
+{
+	HMODULE hMod = NULL;
+	if (GetModuleHandleExA(
+					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+							GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					(LPCSTR)(DWORD_PTR)addr, &hMod))
+	{
+		char modPath[MAX_PATH];
+		if (GetModuleFileNameA(hMod, modPath, MAX_PATH))
+		{
+			/* Extract just the filename from the full path */
+			const char *name = modPath;
+			const char *p = modPath;
+			while (*p)
+			{
+				if (*p == '\\' || *p == '/')
+					name = p + 1;
+				p++;
+			}
+			DWORD offset = addr - (DWORD)(DWORD_PTR)hMod;
+			_snprintf_s(outBuf, bufSize, bufSize, "%s+0x%X", name, offset);
+			outBuf[bufSize - 1] = 0;
+			return;
+		}
+	}
+	_snprintf_s(outBuf, bufSize, bufSize, "unknown");
+	outBuf[bufSize - 1] = 0;
+}
+
 static void LogStackTrace(int skipFrames)
 {
 	void *frames[MAX_STACK_FRAMES];
@@ -342,8 +374,10 @@ static void LogStackTrace(int skipFrames)
 					(unsigned)i, addr, addr - baseAddr);
 		} else
 		{
-			Log("[MEMFIX]     #%u: 0x%08X  (external DLL)\r\n",
-					(unsigned)i, addr);
+			char modInfo[256];
+			GetModuleForAddress(addr, modInfo, sizeof(modInfo));
+			Log("[MEMFIX]     #%u: 0x%08X  (%s)\r\n",
+					(unsigned)i, addr, modInfo);
 		}
 	}
 }
@@ -919,8 +953,10 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 					(unsigned)i, addr, addr - baseAddr);
 		} else
 		{
-			Log("[MEMFIX]   #%u: 0x%08X  (external)\r\n",
-					(unsigned)i, addr);
+			char modInfo[256];
+			GetModuleForAddress(addr, modInfo, sizeof(modInfo));
+			Log("[MEMFIX]   #%u: 0x%08X  (%s)\r\n",
+					(unsigned)i, addr, modInfo);
 		}
 	}
 	Log("[MEMFIX] ====================================\r\n");
@@ -1076,6 +1112,30 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
+	/* Log all loaded modules — helps identify which DLL is making
+	 * the runaway allocations (shows up as "external" in stack traces) */
+	Log("[MEMFIX] --- Loaded modules ---\r\n");
+	{
+		HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+		if (snap != INVALID_HANDLE_VALUE)
+		{
+			MODULEENTRY32 me;
+			me.dwSize = sizeof(me);
+			if (Module32First(snap, &me))
+			{
+				do
+				{
+					Log("[MEMFIX]   0x%08X - 0x%08X  %S\r\n",
+							(unsigned)(DWORD_PTR)me.modBaseAddr,
+							(unsigned)((DWORD_PTR)me.modBaseAddr + me.modBaseSize),
+							me.szModule);
+				} while (Module32Next(snap, &me));
+			}
+			CloseHandle(snap);
+		}
+	}
+	Log("[MEMFIX] --- End modules ---\r\n");
+
 	Log("[MEMFIX] === All hooks installed — fix is ACTIVE ===\r\n");
 	return TRUE;
 }
@@ -1128,7 +1188,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.3  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.4  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
