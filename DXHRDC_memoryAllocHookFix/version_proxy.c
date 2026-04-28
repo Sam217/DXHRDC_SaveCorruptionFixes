@@ -37,6 +37,11 @@
  *     Our hook caps the count to MAX_INSTANCES (50000) and fixes up
  *     the stream position to skip unprocessed entries.
  *
+ *   Hook 6 — DynArray_PushBack_8bytes  (RVA 0x002b0dd0, __thiscall)
+ *     UNIVERSAL SAFETY NET.  Called by 50+ functions for all DynArray
+ *     growth.  When any caller has a runaway loop, this hook caps the
+ *     array at MAX_DYNARRAY_ELEMENTS (100000) and logs the caller RVA.
+ *
  * BUILD (VS2022 — open "x86 Native Tools Command Prompt for VS 2022"):
  *
  *   cl /LD /O2 /GS- version_proxy.c /Fe:version.dll ^
@@ -748,6 +753,84 @@ static void __fastcall Hook_LoadFromStream(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9c. HOOK 6 — DynArray_PushBack_8bytes (universal growth cap)
+ *
+ * RVA 0x002b0dd0   __thiscall   void (undefined4* element)
+ *
+ * This is the GENERIC fix.  Called by 50+ functions throughout the
+ * game for all DynArray<8-byte-element> growth.  When any caller
+ * has a runaway loop (corrupted save count, etc.), this hook
+ * prevents the DynArray from growing beyond MAX_DYNARRAY_ELEMENTS.
+ *
+ * Prologue (5 bytes stolen):
+ *   002b0dd0  56            PUSH ESI
+ *   002b0dd1  8B F1         MOV ESI, ECX
+ *   002b0dd3  8B 0E         MOV ECX, [ESI]
+ *
+ * DynArray layout (this pointer):
+ *   this[0] = count     (current number of elements)
+ *   this[1] = capacity  (allocated slots)
+ *   this[2] = buffer    (pointer to element data)
+ *
+ * Returns void.  RET 0x4 (callee cleans 1 stack arg).
+ * ================================================================ */
+
+#define RVA_PUSHBACK 0x002b0dd0
+#define STEAL_PUSHBACK 5
+
+/* Max elements before we refuse to grow.
+ * At 8 bytes/element: 100000 = 800 KB — more than any normal array.
+ * The corrupted path tries to grow to 128 million entries. */
+#define MAX_DYNARRAY_ELEMENTS 100000
+
+static HookCtx g_hkPushBack;
+static volatile LONG g_pushbackWarnings = 0; /* throttle logging */
+
+typedef void(__fastcall *OrigPushBack_t)(void *, void *, void *);
+
+static void __fastcall Hook_DynArrayPushBack(void *this_, void *edx_,
+																						 void *element)
+{
+	unsigned int *arr = (unsigned int *)this_;
+	unsigned int count = arr[0];
+
+	if (count >= MAX_DYNARRAY_ELEMENTS)
+	{
+		/* Runaway growth detected — refuse the push.
+		 * Log the first few occurrences with caller address. */
+		LONG warned = InterlockedIncrement(&g_pushbackWarnings);
+		if (warned <= 5)
+		{
+			void *caller = NULL;
+			CaptureStackBackTrace(1, 1, &caller, NULL);
+
+			BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+			DWORD callerAddr = (DWORD)(DWORD_PTR)caller;
+			DWORD baseAddr = (DWORD)(DWORD_PTR)base;
+
+			Log("[MEMFIX] *** DynArray GROWTH BLOCKED ***\r\n");
+			Log("[MEMFIX]   count=%u (max=%u), capacity=%u\r\n",
+					count, MAX_DYNARRAY_ELEMENTS, arr[1]);
+			Log("[MEMFIX]   caller: 0x%08X (EXE RVA 0x%08X)\r\n",
+					callerAddr, callerAddr - baseAddr);
+
+			if (warned == 5)
+			{
+				Log("[MEMFIX]   (further DynArray warnings suppressed)\r\n");
+			}
+		}
+		/* Skip the push — return without modifying the array.
+		 * The caller's loop continues but the array doesn't grow,
+		 * so no more allocations are triggered. */
+		return;
+	}
+
+	/* Normal case — delegate to original PushBack */
+	OrigPushBack_t orig = (OrigPushBack_t)(g_hkPushBack.trampoline);
+	orig(this_, edx_, element);
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -967,6 +1050,32 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
+	/* Hook 6: DynArray_PushBack_8bytes — universal growth cap.
+	 * This is the MAIN safety net.  It catches runaway growth from
+	 * ANY caller, not just LoadFromStream. */
+	BYTE *pPushBack = base + RVA_PUSHBACK;
+	LogBytes("DynArrayPush   ", pPushBack, 16);
+
+	if (pPushBack[0] != 0x56 || pPushBack[1] != 0x8B || pPushBack[2] != 0xF1)
+	{
+		Log("[MEMFIX] WARNING: DynArray_PushBack prologue mismatch! "
+				"Expected 56 8B F1, got %02X %02X %02X\r\n",
+				pPushBack[0], pPushBack[1], pPushBack[2]);
+		Log("[MEMFIX]   Hook 6 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkPushBack, pPushBack,
+										 Hook_DynArrayPushBack, STEAL_PUSHBACK))
+		{
+			Log("[MEMFIX] FAILED to hook DynArray_PushBack\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked DynArray_PushBack"
+					" (element cap = %u)\r\n",
+					MAX_DYNARRAY_ELEMENTS);
+		}
+	}
+
 	Log("[MEMFIX] === All hooks installed — fix is ACTIVE ===\r\n");
 	return TRUE;
 }
@@ -1019,7 +1128,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.1  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.3  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
