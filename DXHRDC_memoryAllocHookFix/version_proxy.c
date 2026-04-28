@@ -380,7 +380,6 @@ static void LogStackTrace(int skipFrames)
 		}
 	}
 }
-}
 
 /* ================================================================
  * 4. INLINE HOOK ENGINE  (32-bit x86 only)
