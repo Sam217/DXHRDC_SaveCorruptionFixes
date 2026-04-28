@@ -930,6 +930,132 @@ static void __fastcall Hook_DynArray4PushBack(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9e. HOOK 8 — Hud::LoadActiveGroups (loop termination fix)
+ *
+ * RVA 0x0041e080   __thiscall   byte (uint* stream)
+ *
+ * GAME BUG: This function reads 4-byte values from the save stream
+ * in a while(true) loop, breaking only when it reads a 0 terminator.
+ * When the stream runs out of data WITHOUT a 0 terminator (corrupted
+ * save), the loop continues forever — the last non-zero value stays
+ * in EDI and the JZ exit never triggers.
+ *
+ * Our replacement adds two safety exits:
+ *   1. Break when stream is exhausted (consumed >= total)
+ *   2. Break after MAX_HUD_GROUPS iterations
+ *
+ * Prologue (6 bytes stolen):
+ *   0041e080  51            PUSH ECX
+ *   0041e081  53            PUSH EBX
+ *   0041e082  55            PUSH EBP
+ *   0041e083  8B E9         MOV EBP, ECX
+ *   0041e085  56            PUSH ESI
+ *
+ * Returns BYTE via AL.  RET 0x4 (callee cleans 1 stack arg).
+ * ================================================================ */
+
+#define RVA_LOADGROUPS 0x0041e080
+#define STEAL_LOADGROUPS 6
+
+#define MAX_HUD_GROUPS 1000 /* normal gameplay: < 100 */
+
+static HookCtx g_hkLoadGroups;
+
+/* We need to call FUN_00215fc0 (init) and FUN_0041de80 (PushActiveGroup) */
+typedef void(__fastcall *InitFunc_t)(void *, void *);
+typedef void(__fastcall *PushGroupFunc_t)(void *, void *, void *, int, int);
+
+/* RVAs from the disassembly */
+#define RVA_HUD_INIT_CALL 0x00215fc0
+#define RVA_PUSH_ACTIVE_GRP 0x0041de80
+
+static unsigned char __fastcall Hook_LoadActiveGroups(void *this_, void *edx_,
+																											unsigned int *stream)
+{
+	BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+	unsigned char success = 1;
+	int iterations = 0;
+
+	/* Replicate: call FUN_00215fc0(this + 4)
+	 * The original does: LEA ESI,[EBP+4]; MOV ECX,ESI; CALL 00215fc0 */
+	InitFunc_t initFn = (InitFunc_t)(base + RVA_HUD_INIT_CALL);
+	char *thisBytes = (char *)this_;
+	initFn(thisBytes + 4, NULL);
+
+	/* Clear this->field_4 (the original does MOV [ESI], 0) */
+	*(unsigned int *)(thisBytes + 4) = 0;
+
+	unsigned int prevValue = 0;
+
+	while (1)
+	{
+		/* Read 4 bytes from stream (if available) */
+		unsigned int consumed = stream[0];
+		unsigned int total = stream[1];
+		unsigned int value = 0;
+
+		if (consumed + 4 <= total)
+		{
+			unsigned int *readPtr = (unsigned int *)stream[2];
+			value = *readPtr;
+			stream[2] = (unsigned int)(readPtr + 1);
+			stream[0] = consumed + 4;
+		} else
+		{
+			/* ★ STREAM EXHAUSTED — original game loops forever here!
+			 * This is the bug fix: break when no more data. */
+			Log("[MEMFIX] LoadActiveGroups: stream exhausted after"
+					" %d iterations (consumed=%u, total=%u)\r\n",
+					iterations, consumed, total);
+			success = 0;
+			break;
+		}
+
+		/* Zero terminator → normal exit */
+		if (value == 0)
+			break;
+
+		/* Call PushActiveGroup with previous value (original logic) */
+		if (prevValue != 0)
+		{
+			PushGroupFunc_t pushFn = (PushGroupFunc_t)(base + RVA_PUSH_ACTIVE_GRP);
+			pushFn(this_, NULL, &prevValue, 0, 0);
+		}
+		prevValue = value;
+
+		iterations++;
+		if (iterations >= MAX_HUD_GROUPS)
+		{
+			Log("[MEMFIX] LoadActiveGroups: hit iteration cap (%d),"
+					" draining remaining stream data\r\n",
+					MAX_HUD_GROUPS);
+
+			/* Drain stream: advance past remaining data until we find
+			 * a 0 terminator or run out of data */
+			while (stream[0] + 4 <= stream[1])
+			{
+				unsigned int *rp = (unsigned int *)stream[2];
+				unsigned int v = *rp;
+				stream[2] = (unsigned int)(rp + 1);
+				stream[0] += 4;
+				if (v == 0)
+					break;
+			}
+			break;
+		}
+	}
+
+	/* Handle the last pending value (original does this after loop) */
+	if (prevValue != 0)
+	{
+		PushGroupFunc_t pushFn = (PushGroupFunc_t)(base + RVA_PUSH_ACTIVE_GRP);
+		pushFn(this_, NULL, &prevValue, 0, 0);
+	}
+
+	return success;
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1238,6 +1364,36 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
+	/* Hook 8: Hud::LoadActiveGroups — loop termination fix.
+	 * GAME BUG: while(true) loop reads stream until 0 terminator,
+	 * but when stream is exhausted without a terminator, the last
+	 * non-zero value stays in EDI and the loop runs forever.
+	 * Our hook replaces the function with a safe version that
+	 * breaks on stream exhaustion and caps iterations. */
+	BYTE *pLoadGroups = base + RVA_LOADGROUPS;
+	LogBytes("LoadActiveGrps ", pLoadGroups, 16);
+
+	if (pLoadGroups[0] != 0x51 || pLoadGroups[1] != 0x53 ||
+			pLoadGroups[2] != 0x55 || pLoadGroups[3] != 0x8B)
+	{
+		Log("[MEMFIX] WARNING: LoadActiveGroups prologue mismatch! "
+				"Expected 51 53 55 8B, got %02X %02X %02X %02X\r\n",
+				pLoadGroups[0], pLoadGroups[1], pLoadGroups[2], pLoadGroups[3]);
+		Log("[MEMFIX]   Hook 8 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLoadGroups, pLoadGroups,
+										 (void *)Hook_LoadActiveGroups, STEAL_LOADGROUPS))
+		{
+			Log("[MEMFIX] FAILED to hook LoadActiveGroups\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked LoadActiveGroups"
+					" (iteration cap = %u)\r\n",
+					MAX_HUD_GROUPS);
+		}
+	}
+
 	/* Log all loaded modules — helps identify which DLL is making
 	 * the runaway allocations (shows up as "external" in stack traces) */
 	Log("[MEMFIX] --- Loaded modules ---\r\n");
@@ -1314,7 +1470,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.6  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.7  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
