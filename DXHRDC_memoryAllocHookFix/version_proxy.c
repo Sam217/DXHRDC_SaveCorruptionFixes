@@ -30,6 +30,13 @@
  *     Without this, passing a VirtualAlloc'd pointer to dlmalloc
  *     would corrupt the game's internal heap.
  *
+ *   Hook 5 — InstanceTable::LoadFromStream  (RVA 0x000eceb0, __thiscall)
+ *     ROOT CAUSE FIX.  Reads a count from the save stream and loops
+ *     that many times restoring game instances.  Corrupted saves have
+ *     huge counts causing runaway DynArray growth (128→256→512→1024 MB).
+ *     Our hook caps the count to MAX_INSTANCES (50000) and fixes up
+ *     the stream position to skip unprocessed entries.
+ *
  * BUILD (VS2022 — open "x86 Native Tools Command Prompt for VS 2022"):
  *
  *   cl /LD /O2 /GS- version_proxy.c /Fe:version.dll ^
@@ -126,43 +133,56 @@ static void LoadRealVersionDLL(void)
 		g_procs[i] = GetProcAddress(g_realVersion, g_procNames[i]);
 }
 
-/* --- Forwarding stubs (exported via version.def) --- */
+/* --- Forwarding stubs ---
+ *
+ * These are named EXACTLY like the real version.dll functions.
+ * This works because we do NOT link against version.lib — we
+ * load the real DLL manually via LoadLibrary/GetProcAddress.
+ *
+ * The .def file exports these names. The MSVC linker auto-strips
+ * the __stdcall decoration (_Name@N) when exporting via .def,
+ * producing clean undecorated exports that match what callers expect.
+ *
+ * IMPORTANT: No __declspec(dllexport) here! The .def file is the
+ * sole export mechanism. Mixing both causes name decoration conflicts
+ * on 32-bit MSVC where __stdcall adds _Name@N suffixes.
+ */
 
-typedef BOOL(WINAPI *t_GFVI_A)(LPCSTR, DWORD, DWORD, LPVOID);
-typedef BOOL(WINAPI *t_GFVI_W)(LPCWSTR, DWORD, DWORD, LPVOID);
-typedef DWORD(WINAPI *t_GFVIS_A)(LPCSTR, LPDWORD);
-typedef DWORD(WINAPI *t_GFVIS_W)(LPCWSTR, LPDWORD);
-typedef BOOL(WINAPI *t_VQV_A)(LPCVOID, LPCSTR, LPVOID *, PUINT);
-typedef BOOL(WINAPI *t_VQV_W)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
-typedef DWORD(WINAPI *t_VFF_A)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT, LPSTR, PUINT);
-typedef DWORD(WINAPI *t_VFF_W)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT, LPWSTR, PUINT);
-typedef DWORD(WINAPI *t_VIF_A)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT);
-typedef DWORD(WINAPI *t_VIF_W)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT);
-typedef DWORD(WINAPI *t_VLN_A)(DWORD, LPSTR, DWORD);
-typedef DWORD(WINAPI *t_VLN_W)(DWORD, LPWSTR, DWORD);
-typedef BOOL(WINAPI *t_GFVIX_A)(DWORD, LPCSTR, DWORD, DWORD, LPVOID);
-typedef BOOL(WINAPI *t_GFVIX_W)(DWORD, LPCWSTR, DWORD, DWORD, LPVOID);
-typedef DWORD(WINAPI *t_GFVISX_A)(DWORD, LPCSTR, LPDWORD);
-typedef DWORD(WINAPI *t_GFVISX_W)(DWORD, LPCWSTR, LPDWORD);
+typedef BOOL(WINAPI *t_GFVI)(LPCSTR, DWORD, DWORD, LPVOID);
+typedef BOOL(WINAPI *t_GFVIW)(LPCWSTR, DWORD, DWORD, LPVOID);
+typedef DWORD(WINAPI *t_GFVIS)(LPCSTR, LPDWORD);
+typedef DWORD(WINAPI *t_GFVISW)(LPCWSTR, LPDWORD);
+typedef BOOL(WINAPI *t_VQV)(LPCVOID, LPCSTR, LPVOID *, PUINT);
+typedef BOOL(WINAPI *t_VQVW)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+typedef DWORD(WINAPI *t_VFF)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT, LPSTR, PUINT);
+typedef DWORD(WINAPI *t_VFFW)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT, LPWSTR, PUINT);
+typedef DWORD(WINAPI *t_VIF)(DWORD, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPCSTR, LPSTR, PUINT);
+typedef DWORD(WINAPI *t_VIFW)(DWORD, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPWSTR, PUINT);
+typedef DWORD(WINAPI *t_VLN)(DWORD, LPSTR, DWORD);
+typedef DWORD(WINAPI *t_VLNW)(DWORD, LPWSTR, DWORD);
+typedef BOOL(WINAPI *t_GFVIX)(DWORD, LPCSTR, DWORD, DWORD, LPVOID);
+typedef BOOL(WINAPI *t_GFVIXW)(DWORD, LPCWSTR, DWORD, DWORD, LPVOID);
+typedef DWORD(WINAPI *t_GFVISX)(DWORD, LPCSTR, LPDWORD);
+typedef DWORD(WINAPI *t_GFVISXW)(DWORD, LPCWSTR, LPDWORD);
 
 #define FWD(idx, type) ((type)g_procs[idx])
 
-__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoA(LPCSTR a, DWORD b, DWORD c, LPVOID d) { return FWD(FN_GetFileVersionInfoA, t_GFVI_A) ? FWD(FN_GetFileVersionInfoA, t_GFVI_A)(a, b, c, d) : FALSE; }
-__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoW(LPCWSTR a, DWORD b, DWORD c, LPVOID d) { return FWD(FN_GetFileVersionInfoW, t_GFVI_W) ? FWD(FN_GetFileVersionInfoW, t_GFVI_W)(a, b, c, d) : FALSE; }
-__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeA(LPCSTR a, LPDWORD b) { return FWD(FN_GetFileVersionInfoSizeA, t_GFVIS_A) ? FWD(FN_GetFileVersionInfoSizeA, t_GFVIS_A)(a, b) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeW(LPCWSTR a, LPDWORD b) { return FWD(FN_GetFileVersionInfoSizeW, t_GFVIS_W) ? FWD(FN_GetFileVersionInfoSizeW, t_GFVIS_W)(a, b) : 0; }
-__declspec(dllexport) BOOL WINAPI fwd_VerQueryValueA(LPCVOID a, LPCSTR b, LPVOID *c, PUINT d) { return FWD(FN_VerQueryValueA, t_VQV_A) ? FWD(FN_VerQueryValueA, t_VQV_A)(a, b, c, d) : FALSE; }
-__declspec(dllexport) BOOL WINAPI fwd_VerQueryValueW(LPCVOID a, LPCWSTR b, LPVOID *c, PUINT d) { return FWD(FN_VerQueryValueW, t_VQV_W) ? FWD(FN_VerQueryValueW, t_VQV_W)(a, b, c, d) : FALSE; }
-__declspec(dllexport) DWORD WINAPI fwd_VerFindFileA(DWORD a, LPCSTR b, LPCSTR c, LPCSTR d, LPSTR e, PUINT f, LPSTR g, PUINT h) { return FWD(FN_VerFindFileA, t_VFF_A) ? FWD(FN_VerFindFileA, t_VFF_A)(a, b, c, d, e, f, g, h) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_VerFindFileW(DWORD a, LPCWSTR b, LPCWSTR c, LPCWSTR d, LPWSTR e, PUINT f, LPWSTR g, PUINT h) { return FWD(FN_VerFindFileW, t_VFF_W) ? FWD(FN_VerFindFileW, t_VFF_W)(a, b, c, d, e, f, g, h) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_VerInstallFileA(DWORD a, LPCSTR b, LPCSTR c, LPCSTR d, LPCSTR e, LPCSTR f, LPSTR g, PUINT h) { return FWD(FN_VerInstallFileA, t_VIF_A) ? FWD(FN_VerInstallFileA, t_VIF_A)(a, b, c, d, e, f, g, h) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_VerInstallFileW(DWORD a, LPCWSTR b, LPCWSTR c, LPCWSTR d, LPCWSTR e, LPCWSTR f, LPWSTR g, PUINT h) { return FWD(FN_VerInstallFileW, t_VIF_W) ? FWD(FN_VerInstallFileW, t_VIF_W)(a, b, c, d, e, f, g, h) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_VerLanguageNameA(DWORD a, LPSTR b, DWORD c) { return FWD(FN_VerLanguageNameA, t_VLN_A) ? FWD(FN_VerLanguageNameA, t_VLN_A)(a, b, c) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_VerLanguageNameW(DWORD a, LPWSTR b, DWORD c) { return FWD(FN_VerLanguageNameW, t_VLN_W) ? FWD(FN_VerLanguageNameW, t_VLN_W)(a, b, c) : 0; }
-__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoExA(DWORD a, LPCSTR b, DWORD c, DWORD d, LPVOID e) { return FWD(FN_GetFileVersionInfoExA, t_GFVIX_A) ? FWD(FN_GetFileVersionInfoExA, t_GFVIX_A)(a, b, c, d, e) : FALSE; }
-__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoExW(DWORD a, LPCWSTR b, DWORD c, DWORD d, LPVOID e) { return FWD(FN_GetFileVersionInfoExW, t_GFVIX_W) ? FWD(FN_GetFileVersionInfoExW, t_GFVIX_W)(a, b, c, d, e) : FALSE; }
-__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeExA(DWORD a, LPCSTR b, LPDWORD c) { return FWD(FN_GetFileVersionInfoSizeExA, t_GFVISX_A) ? FWD(FN_GetFileVersionInfoSizeExA, t_GFVISX_A)(a, b, c) : 0; }
-__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeExW(DWORD a, LPCWSTR b, LPDWORD c) { return FWD(FN_GetFileVersionInfoSizeExW, t_GFVISX_W) ? FWD(FN_GetFileVersionInfoSizeExW, t_GFVISX_W)(a, b, c) : 0; }
+__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoA(LPCSTR a, DWORD b, DWORD c, LPVOID d) { return FWD(FN_GetFileVersionInfoA, t_GFVI) ? FWD(FN_GetFileVersionInfoA, t_GFVI)(a, b, c, d) : FALSE; }
+__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoW(LPCWSTR a, DWORD b, DWORD c, LPVOID d) { return FWD(FN_GetFileVersionInfoW, t_GFVIW) ? FWD(FN_GetFileVersionInfoW, t_GFVIW)(a, b, c, d) : FALSE; }
+__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeA(LPCSTR a, LPDWORD b) { return FWD(FN_GetFileVersionInfoSizeA, t_GFVIS) ? FWD(FN_GetFileVersionInfoSizeA, t_GFVIS)(a, b) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeW(LPCWSTR a, LPDWORD b) { return FWD(FN_GetFileVersionInfoSizeW, t_GFVISW) ? FWD(FN_GetFileVersionInfoSizeW, t_GFVISW)(a, b) : 0; }
+__declspec(dllexport) BOOL WINAPI fwd_VerQueryValueA(LPCVOID a, LPCSTR b, LPVOID *c, PUINT d) { return FWD(FN_VerQueryValueA, t_VQV) ? FWD(FN_VerQueryValueA, t_VQV)(a, b, c, d) : FALSE; }
+__declspec(dllexport) BOOL WINAPI fwd_VerQueryValueW(LPCVOID a, LPCWSTR b, LPVOID *c, PUINT d) { return FWD(FN_VerQueryValueW, t_VQVW) ? FWD(FN_VerQueryValueW, t_VQVW)(a, b, c, d) : FALSE; }
+__declspec(dllexport) DWORD WINAPI fwd_VerFindFileA(DWORD a, LPCSTR b, LPCSTR c, LPCSTR d, LPSTR e, PUINT f, LPSTR g, PUINT h) { return FWD(FN_VerFindFileA, t_VFF) ? FWD(FN_VerFindFileA, t_VFF)(a, b, c, d, e, f, g, h) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_VerFindFileW(DWORD a, LPCWSTR b, LPCWSTR c, LPCWSTR d, LPWSTR e, PUINT f, LPWSTR g, PUINT h) { return FWD(FN_VerFindFileW, t_VFFW) ? FWD(FN_VerFindFileW, t_VFFW)(a, b, c, d, e, f, g, h) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_VerInstallFileA(DWORD a, LPCSTR b, LPCSTR c, LPCSTR d, LPCSTR e, LPCSTR f, LPSTR g, PUINT h) { return FWD(FN_VerInstallFileA, t_VIF) ? FWD(FN_VerInstallFileA, t_VIF)(a, b, c, d, e, f, g, h) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_VerInstallFileW(DWORD a, LPCWSTR b, LPCWSTR c, LPCWSTR d, LPCWSTR e, LPCWSTR f, LPWSTR g, PUINT h) { return FWD(FN_VerInstallFileW, t_VIFW) ? FWD(FN_VerInstallFileW, t_VIFW)(a, b, c, d, e, f, g, h) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_VerLanguageNameA(DWORD a, LPSTR b, DWORD c) { return FWD(FN_VerLanguageNameA, t_VLN) ? FWD(FN_VerLanguageNameA, t_VLN)(a, b, c) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_VerLanguageNameW(DWORD a, LPWSTR b, DWORD c) { return FWD(FN_VerLanguageNameW, t_VLNW) ? FWD(FN_VerLanguageNameW, t_VLNW)(a, b, c) : 0; }
+__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoExA(DWORD a, LPCSTR b, DWORD c, DWORD d, LPVOID e) { return FWD(FN_GetFileVersionInfoExA, t_GFVIX) ? FWD(FN_GetFileVersionInfoExA, t_GFVIX)(a, b, c, d, e) : FALSE; }
+__declspec(dllexport) BOOL WINAPI fwd_GetFileVersionInfoExW(DWORD a, LPCWSTR b, DWORD c, DWORD d, LPVOID e) { return FWD(FN_GetFileVersionInfoExW, t_GFVIXW) ? FWD(FN_GetFileVersionInfoExW, t_GFVIXW)(a, b, c, d, e) : FALSE; }
+__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeExA(DWORD a, LPCSTR b, LPDWORD c) { return FWD(FN_GetFileVersionInfoSizeExA, t_GFVISX) ? FWD(FN_GetFileVersionInfoSizeExA, t_GFVISX)(a, b, c) : 0; }
+__declspec(dllexport) DWORD WINAPI fwd_GetFileVersionInfoSizeExW(DWORD a, LPCWSTR b, LPDWORD c) { return FWD(FN_GetFileVersionInfoSizeExW, t_GFVISXW) ? FWD(FN_GetFileVersionInfoSizeExW, t_GFVISXW)(a, b, c) : 0; }
 
 /* ================================================================
  * 2. FALLBACK ALLOCATION TRACKING
@@ -610,6 +630,124 @@ static void __fastcall Hook_Free(void *this_, void *edx_, int ptr)
 }
 
 /* ================================================================
+ * 9b. HOOK 5 — InstanceTable::LoadFromStream (instance count cap)
+ *
+ * RVA 0x000eceb0   __thiscall   void (uint* stream)
+ *
+ * This function reads a count from the save stream and loops that
+ * many times, restoring game object instances and pushing them into
+ * a DynArray.  When the save file is corrupted, the count can be
+ * millions or billions, causing runaway geometric DynArray growth
+ * (128→256→512→1024 MB) until OOM.
+ *
+ * Prologue (5 bytes stolen):
+ *   000eceb0  83 EC 08      SUB ESP, 0x8
+ *   000eceb3  53            PUSH EBX
+ *   000eceb4  56            PUSH ESI
+ *
+ * Stream layout:
+ *   stream[0] = bytes consumed (uint)
+ *   stream[1] = total bytes available (uint)
+ *   stream[2] = current read pointer (BYTE*)
+ *
+ * Data at read pointer: [1-byte flag] [4-byte count] [count × 4-byte indices]
+ *
+ * Our hook peeks at the count, caps it if insane, patches the stream
+ * data in-place, calls the original, then fixes up the stream position
+ * to skip the entries we discarded.
+ * ================================================================ */
+
+#define RVA_LOADSTREAM 0x000eceb0
+#define STEAL_LOADSTREAM 5
+
+/* Maximum number of instances to restore from a save file.
+ * Normal gameplay: hundreds at most.
+ * 50000 is extremely generous while preventing runaway loops. */
+#define MAX_INSTANCES 50000
+
+static HookCtx g_hkLoadStream;
+
+typedef void(__fastcall *OrigLoadStream_t)(void *, void *, unsigned int *);
+
+static void __fastcall Hook_LoadFromStream(void *this_, void *edx_,
+																					 unsigned int *stream)
+{
+	/* Stream: [0]=consumed, [1]=total, [2]=read_ptr */
+	unsigned int pos = stream[0];
+	unsigned int total = stream[1];
+	BYTE *dataPtr = (BYTE *)stream[2];
+
+	/* The function reads 1 byte (flag) then 4 bytes (count).
+	 * Peek at the count without advancing the stream. */
+	unsigned int original_count = 0;
+	BOOL capped = FALSE;
+
+	if (pos + 5 <= total)
+	{
+		/* Count is at dataPtr + 1 (after the 1-byte flag) */
+		unsigned int count;
+		memcpy(&count, dataPtr + 1, 4); /* safe unaligned read */
+
+		if (count > MAX_INSTANCES)
+		{
+			original_count = count;
+			capped = TRUE;
+
+			Log("[MEMFIX] *** SAVE CORRUPTION DETECTED ***\r\n");
+			Log("[MEMFIX]   InstanceTable::LoadFromStream count = %u"
+					" (expected < %u)\r\n",
+					count, MAX_INSTANCES);
+			Log("[MEMFIX]   Capping to %u to prevent runaway allocation\r\n",
+					MAX_INSTANCES);
+
+			/* Patch the count in-place in the stream buffer */
+			unsigned int capped_val = MAX_INSTANCES;
+			memcpy(dataPtr + 1, &capped_val, 4);
+		}
+	}
+
+	/* Call original function (reads the now-capped count) */
+	OrigLoadStream_t orig = (OrigLoadStream_t)(g_hkLoadStream.trampoline);
+	orig(this_, edx_, stream);
+
+	/* Fix up stream position: skip the entries we didn't process.
+	 * Each entry is 4 bytes (a uint instance index).
+	 * The original only read MAX_INSTANCES entries; we need to
+	 * advance past the remaining (original_count - MAX_INSTANCES) entries. */
+	if (capped && original_count > MAX_INSTANCES)
+	{
+		unsigned int skipped_entries = original_count - MAX_INSTANCES;
+		unsigned int skip_bytes = skipped_entries * 4;
+
+		/* Don't advance past end of stream */
+		unsigned int remaining = total - stream[0];
+		if (skip_bytes > remaining)
+		{
+			Log("[MEMFIX]   Stream too short to skip all entries,"
+					" advancing to end (remaining=%u, need=%u)\r\n",
+					remaining, skip_bytes);
+			skip_bytes = remaining;
+		}
+
+		stream[0] += skip_bytes;
+		stream[2] = (unsigned int)((BYTE *)stream[2] + skip_bytes);
+
+		Log("[MEMFIX]   Stream position fixed: skipped %u bytes"
+				" (%u discarded entries)\r\n",
+				skip_bytes, skipped_entries);
+
+		/* Restore original count in stream data so we don't leave
+		 * a modified save buffer (even though it's a temp buffer) */
+		BYTE *count_location = dataPtr + 1;
+		/* Only restore if the pointer is still within stream bounds */
+		if ((unsigned int)(count_location - (BYTE *)0) < 0xFFFF0000)
+		{
+			memcpy(count_location, &original_count, 4);
+		}
+	}
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -634,6 +772,8 @@ static void LogBytes(const char *label, BYTE *addr, int n)
  * normal crash dialog still appears.  We just add logging.
  * ================================================================ */
 
+static volatile LONG g_exceptionLogged = 0; /* log only once */
+
 static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 {
 	DWORD code = info->ExceptionRecord->ExceptionCode;
@@ -643,6 +783,13 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 			code != EXCEPTION_ILLEGAL_INSTRUCTION &&
 			code != EXCEPTION_STACK_OVERFLOW &&
 			code != EXCEPTION_PRIV_INSTRUCTION)
+	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	/* Log only the first exception — prevents infinite spam when
+	 * the exception re-fires because no handler resolved it. */
+	if (InterlockedCompareExchange(&g_exceptionLogged, 1, 0) != 0)
 	{
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
@@ -792,7 +939,35 @@ static BOOL InstallAllHooks(void)
 	}
 	Log("[MEMFIX] [OK] Hooked Free\r\n");
 
-	Log("[MEMFIX] === All 4 hooks installed — fix is ACTIVE ===\r\n");
+	/* Hook 5: LoadFromStream — cap instance count to prevent
+	 * runaway DynArray growth from corrupted save data */
+	BYTE *pLoadStream = base + RVA_LOADSTREAM;
+	LogBytes("LoadFromStream ", pLoadStream, 16);
+
+	if (pLoadStream[0] != 0x83 || pLoadStream[1] != 0xEC ||
+			pLoadStream[3] != 0x53 || pLoadStream[4] != 0x56)
+	{
+		Log("[MEMFIX] WARNING: LoadFromStream prologue mismatch! "
+				"Expected 83 EC xx 53 56, got %02X %02X %02X %02X %02X\r\n",
+				pLoadStream[0], pLoadStream[1], pLoadStream[2],
+				pLoadStream[3], pLoadStream[4]);
+		Log("[MEMFIX]   Hook 5 SKIPPED — other hooks still active\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLoadStream, pLoadStream,
+										 Hook_LoadFromStream, STEAL_LOADSTREAM))
+		{
+			Log("[MEMFIX] FAILED to hook LoadFromStream\r\n");
+			/* Non-fatal: other hooks still provide fallback protection */
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked LoadFromStream"
+					" (instance cap = %u)\r\n",
+					MAX_INSTANCES);
+		}
+	}
+
+	Log("[MEMFIX] === All hooks installed — fix is ACTIVE ===\r\n");
 	return TRUE;
 }
 
