@@ -467,13 +467,29 @@ static volatile BOOL g_suppressOOM = FALSE;
 
 typedef void(__cdecl *OrigGamePrintError_t)(const char *fmt, ...);
 
+/* Helper: safe vsnprintf that catches access violations from
+ * corrupted format arguments (e.g. %s pointing to 0x00001005) */
+static int SafeVsnprintf(char *buf, size_t bufSize,
+												 const char *fmt, va_list ap)
+{
+	__try
+	{
+		return _vsnprintf_s(buf, bufSize, _TRUNCATE, fmt, ap);
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return _snprintf_s(buf, bufSize, _TRUNCATE,
+											 "(format crashed — bad pointer in args, fmt=0x%08X)",
+											 (unsigned)(DWORD_PTR)fmt);
+	}
+}
+
 static void __cdecl Hook_GamePrintError(const char *fmt, ...)
 {
 	/* Format the message (same as original would) */
 	char buf[1024];
 	va_list ap;
 	va_start(ap, fmt);
-	_vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+	SafeVsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 
 	if (g_suppressOOM)
@@ -1470,7 +1486,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.7  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.8  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
