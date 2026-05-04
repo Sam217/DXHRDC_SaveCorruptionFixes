@@ -467,6 +467,8 @@ static volatile BOOL g_suppressOOM = FALSE;
 
 typedef void(__cdecl *OrigGamePrintError_t)(const char *fmt, ...);
 
+static volatile LONG g_gamePrintErrorCount = 0;
+
 /* Helper: safe vsnprintf that catches access violations from
  * corrupted format arguments (e.g. %s pointing to 0x00001005) */
 static int SafeVsnprintf(char *buf, size_t bufSize,
@@ -485,7 +487,9 @@ static int SafeVsnprintf(char *buf, size_t bufSize,
 
 static void __cdecl Hook_GamePrintError(const char *fmt, ...)
 {
-	/* Format the message (same as original would) */
+	LONG callNum = InterlockedIncrement(&g_gamePrintErrorCount);
+	Log("[MEMFIX] >>> GamePrintError ENTERED (call #%ld, suppress=%d)\r\n",
+			callNum, (int)g_suppressOOM);
 	char buf[1024];
 	va_list ap;
 	va_start(ap, fmt);
@@ -1072,6 +1076,128 @@ static unsigned char __fastcall Hook_LoadActiveGroups(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9f. HOOK 9 — GetHeapCategoryName (pointer sanitization)
+ *
+ * RVA 0x001fb660   __cdecl   char* (int categoryId)
+ *
+ * Looks up a category name string from a table at
+ * DAT_015ed7b0 + 0xD4 + categoryId*4.  If the category ID is
+ * corrupted (from bad save data), it indexes way past the table,
+ * reading garbage.  The returned pointer (e.g. 0x00001005) is then
+ * used as a %s argument in error formatting → crash.
+ *
+ * Our hook calls the original, then validates the returned pointer.
+ * If it looks invalid, we return a safe static string.
+ *
+ * Prologue (6 bytes stolen):
+ *   001fb660  A1 B0 D7 5E 01    MOV EAX, [0x015ed7b0]
+ *   001fb665  8B 4C 24 04       MOV ECX, [ESP+4]
+ *
+ * This is __cdecl, returns char*, takes int on stack.
+ * RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_GETCATNAME 0x001fb660
+#define STEAL_GETCATNAME 5 /* MOV EAX,[imm32] = exactly 5 bytes */
+
+static HookCtx g_hkGetCatName;
+
+typedef char *(__cdecl *OrigGetCatName_t)(int);
+
+static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
+{
+	OrigGetCatName_t orig = (OrigGetCatName_t)(g_hkGetCatName.trampoline);
+	char *result = orig(categoryId);
+
+	/* Validate the returned pointer.
+	 * A valid string pointer should be:
+	 * - Non-null
+	 * - In a reasonable memory range (above 0x10000, below 0x7FFE0000)
+	 * - Readable (at least the first byte)
+	 * Invalid pointers like 0x00001005 will be caught here. */
+	if (result == NULL ||
+			(DWORD)(DWORD_PTR)result < 0x10000 ||
+			(DWORD)(DWORD_PTR)result > 0x7FFE0000 ||
+			IsBadReadPtr(result, 1))
+	{
+		/* Return a safe string instead of the garbage pointer */
+		return "(bad_cat)";
+	}
+
+	return result;
+}
+
+/* ================================================================
+ * 9g. HOOK 10 — Direct dlmalloc wrapper (Path B fallback)
+ *
+ * RVA 0x001fe4e0   __thiscall   int (int size, undefined4 extra)
+ *
+ * This function calls cdc::dlmalloc DIRECTLY, bypassing our hooked
+ * MemHeapAllocator::Allocate.  When dlmalloc fails, it returns NULL
+ * to the caller, which then tries to log the error using a different
+ * error path (not GamePrintError), crashing on corrupted args.
+ *
+ * Our hook adds VirtualAlloc fallback — same strategy as Hook 2.
+ *
+ * Prologue (5 bytes stolen):
+ *   001fe4e0  53               PUSH EBX
+ *   001fe4e1  56               PUSH ESI
+ *   001fe4e2  8B F1            MOV ESI, ECX  (partially — 3rd byte)
+ *
+ * Actually we need 6 bytes for two complete instructions:
+ *   001fe4e0  53               PUSH EBX       (1 byte)
+ *   001fe4e1  56               PUSH ESI       (1 byte)
+ *   001fe4e2  8B F1            MOV ESI, ECX   (2 bytes)
+ *   001fe4e4  57               PUSH EDI       (1 byte)
+ *   → 5 bytes = PUSH EBX + PUSH ESI + MOV ESI,ECX + PUSH EDI
+ *     but JMP rel32 needs 5 bytes, and PUSH EBX(1)+PUSH ESI(1)+MOV ESI,ECX(2)=4
+ *     We need at least 5: steal PUSH EBX+PUSH ESI+MOV ESI,ECX+PUSH EDI = 5 bytes
+ *
+ * Returns int (pointer).  RET 0x8 (callee cleans 2 stack args).
+ * ================================================================ */
+
+#define RVA_DIRECTMALLOC 0x001fe4e0
+#define STEAL_DIRECTMALLOC 5
+
+static HookCtx g_hkDirectMalloc;
+
+typedef int(__fastcall *OrigDirectMalloc_t)(void *, void *, int, int);
+
+static int __fastcall Hook_DirectMalloc(void *this_, void *edx_,
+																				int size, int extra)
+{
+	OrigDirectMalloc_t orig = (OrigDirectMalloc_t)(g_hkDirectMalloc.trampoline);
+	int result = orig(this_, edx_, size, extra);
+
+	if (result == 0 && size > 0)
+	{
+		/* Reject insane sizes */
+		if (size < 0 || (MAX_SANE_ALLOC_SIZE > 0 &&
+										 (unsigned)size > MAX_SANE_ALLOC_SIZE))
+		{
+			Log("[MEMFIX] DirectMalloc: REJECTED insane size %d\r\n", size);
+			return 0;
+		}
+
+		void *fb = VirtualAlloc(NULL, (SIZE_T)(unsigned int)size,
+														MEM_COMMIT | MEM_RESERVE,
+														PAGE_READWRITE);
+		if (fb)
+		{
+			TrackAdd(fb, (SIZE_T)(unsigned int)size);
+			result = (int)(DWORD_PTR)fb;
+			Log("[MEMFIX] FALLBACK: DirectMalloc(%u) -> 0x%08X\r\n",
+					(unsigned)size, result);
+		} else
+		{
+			Log("[MEMFIX] FALLBACK FAILED: DirectMalloc(%u) err=%u\r\n",
+					(unsigned)size, GetLastError());
+		}
+	}
+	return result;
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1410,6 +1536,57 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
+	/* Hook 9: GetHeapCategoryName — sanitize category name pointers.
+	 * When the category ID is corrupted, this function returns garbage
+	 * like 0x00001005 which crashes any printf-like function that
+	 * tries to read it as a string.  Fixes ALL error formatting paths. */
+	BYTE *pGetCat = base + RVA_GETCATNAME;
+	LogBytes("GetCatName     ", pGetCat, 16);
+
+	if (pGetCat[0] != 0xA1)
+	{
+		Log("[MEMFIX] WARNING: GetHeapCategoryName prologue mismatch! "
+				"Expected A1, got %02X\r\n",
+				pGetCat[0]);
+		Log("[MEMFIX]   Hook 9 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkGetCatName, pGetCat,
+										 (void *)Hook_GetHeapCategoryName, STEAL_GETCATNAME))
+		{
+			Log("[MEMFIX] FAILED to hook GetHeapCategoryName\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked GetHeapCategoryName (pointer sanitization)\r\n");
+		}
+	}
+
+	/* Hook 10: Direct dlmalloc wrapper (FUN_001fe4e0) — Path B fallback.
+	 * This function calls dlmalloc directly, bypassing our hooked Allocate.
+	 * Without this hook, failed allocations on Path B return NULL and the
+	 * caller crashes.  We add the same VirtualAlloc fallback as Hook 2. */
+	BYTE *pDirect = base + RVA_DIRECTMALLOC;
+	LogBytes("DirectMalloc   ", pDirect, 16);
+
+	if (pDirect[0] != 0x53 || pDirect[1] != 0x56 ||
+			pDirect[2] != 0x8B || pDirect[3] != 0xF1)
+	{
+		Log("[MEMFIX] WARNING: DirectMalloc prologue mismatch! "
+				"Expected 53 56 8B F1, got %02X %02X %02X %02X\r\n",
+				pDirect[0], pDirect[1], pDirect[2], pDirect[3]);
+		Log("[MEMFIX]   Hook 10 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkDirectMalloc, pDirect,
+										 (void *)Hook_DirectMalloc, STEAL_DIRECTMALLOC))
+		{
+			Log("[MEMFIX] FAILED to hook DirectMalloc\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked DirectMalloc (Path B fallback)\r\n");
+		}
+	}
+
 	/* Log all loaded modules — helps identify which DLL is making
 	 * the runaway allocations (shows up as "external" in stack traces) */
 	Log("[MEMFIX] --- Loaded modules ---\r\n");
@@ -1486,7 +1663,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 		LogInit();
 
 		Log("[MEMFIX] =============================================\r\n");
-		Log("[MEMFIX]  DXHR:DC Memory Fix v1.8  (version.dll proxy)\r\n");
+		Log("[MEMFIX]  DXHR:DC Memory Fix v1.9  (version.dll proxy)\r\n");
 		Log("[MEMFIX] =============================================\r\n");
 
 		/* Install vectored exception handler for crash diagnostics.
