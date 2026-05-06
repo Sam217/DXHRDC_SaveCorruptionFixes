@@ -1571,7 +1571,9 @@ static void LogBytes(const char *label, BYTE *addr, int n)
  * normal crash dialog still appears.  We just add logging.
  * ================================================================ */
 
-static volatile LONG g_exceptionLogged = 0; /* log only once */
+static volatile LONG g_exceptionLoggedCount = 0;
+static volatile DWORD g_lastLoggedExAddr = 0;
+#define VEH_MAX_EXCEPTIONS_LOGGED 5
 
 static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 {
@@ -1586,12 +1588,27 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
-	/* Log only the first exception — prevents infinite spam when
-	 * the exception re-fires because no handler resolved it. */
-	if (InterlockedCompareExchange(&g_exceptionLogged, 1, 0) != 0)
+	/* Log up to VEH_MAX_EXCEPTIONS_LOGGED distinct exceptions.
+	 *
+	 * If the SAME EIP is faulting repeatedly (the exception re-fires
+	 * because no SEH handler caught it and the OS keeps invoking VEH),
+	 * suppress to avoid infinite log spam — the first log already
+	 * captured everything useful about that EIP.
+	 *
+	 * If a NEW EIP is faulting (likely an SEH-caught earlier exception
+	 * led to a follow-up crash elsewhere), let it through and log it
+	 * up to the cap. */
+	DWORD exAddrNow = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
+	if (exAddrNow == g_lastLoggedExAddr)
 	{
-		return EXCEPTION_CONTINUE_SEARCH;
+		return EXCEPTION_CONTINUE_SEARCH; /* same EIP — already logged */
 	}
+	if (g_exceptionLoggedCount >= VEH_MAX_EXCEPTIONS_LOGGED)
+	{
+		return EXCEPTION_CONTINUE_SEARCH; /* hit cap */
+	}
+	InterlockedIncrement(&g_exceptionLoggedCount);
+	g_lastLoggedExAddr = exAddrNow;
 
 	BYTE *base = (BYTE *)GetModuleHandleA(NULL);
 	DWORD exAddr = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
