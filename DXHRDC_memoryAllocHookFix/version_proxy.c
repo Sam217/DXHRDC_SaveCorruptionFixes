@@ -1546,6 +1546,69 @@ static void __fastcall Hook_FUN_00065180(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9l. HOOK 15 — cdc::InstanceTable::RestoreInstance (SEH wrap)
+ *
+ * RVA 0x000ecc80   __thiscall   int (InstanceDescriptor *desc)
+ *
+ * Already named in Ghidra by the user as critical.  This is THE
+ * function that restores one instance from save data.  Reads various
+ * fields off the descriptor (param_1) at offsets 0x11c, 0x120, 0x128,
+ * 0x12c, etc.  When the descriptor pointer is corrupted (valid-looking
+ * but pointing at a too-small or unmapped region), the field reads
+ * fault.
+ *
+ * Observed crash: MOVZX EAX, word ptr [EBX + 0x11c] at RVA 0x000ECCFD
+ * with EBX = 0x7F070950 (a corrupted descriptor).  Reading offset 0x11c
+ * = 0x7F070A6C → access violation.
+ *
+ * The function ALREADY has multiple "return 0" early-exit paths for
+ * various validation failures, and the caller of RestoreInstance
+ * checks the return value.  So returning 0 on a fault is the SAME
+ * outcome the function already produces for known-bad inputs — the
+ * caller skips this instance and continues with the next.
+ *
+ * Lose ONE bad instance per fault, not the whole load — exactly the
+ * "discard corrupt data, keep valid" goal from the project brief.
+ *
+ * Prologue (6 bytes stolen — three complete instructions):
+ *   000ecc80  55           PUSH EBP                (1 byte)
+ *   000ecc81  8B EC        MOV EBP, ESP            (2 bytes)
+ *   000ecc83  83 E4 F0    AND ESP, 0xFFFFFFF0      (3 bytes)
+ *
+ * __thiscall (this in ECX), 1 stack arg (descriptor), RET 0x4.
+ * Captured as __fastcall(this, edx_unused, descriptor).
+ * ================================================================ */
+
+#define RVA_RESTORE_INSTANCE 0x000ecc80
+#define STEAL_RESTORE_INSTANCE 6
+
+static HookCtx g_hkRestoreInst;
+static volatile LONG g_restoreInstCatches = 0;
+
+typedef int(__fastcall *OrigRestoreInst_t)(void *this_, void *edx_,
+																					 void *descriptor);
+
+static int __fastcall Hook_RestoreInstance(void *this_, void *edx_,
+																					 void *descriptor)
+{
+	OrigRestoreInst_t orig = (OrigRestoreInst_t)(g_hkRestoreInst.trampoline);
+	__try
+	{
+		return orig(this_, edx_, descriptor);
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LONG n = InterlockedIncrement(&g_restoreInstCatches);
+		if (n <= 20)
+		{
+			Log("[MEMFIX] RestoreInstance: caught fault for descriptor 0x%08X "
+					"(catch #%ld) — corrupt instance descriptor, instance skipped\r\n",
+					(unsigned)(DWORD_PTR)descriptor, n);
+		}
+		return 0; /* same outcome as the function's existing early-exit paths */
+	}
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -2042,6 +2105,38 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked FUN_00065180 (SEH wrap for vtable NULL deref)\r\n");
+		}
+	}
+
+	/* Hook 15: cdc::InstanceTable::RestoreInstance — SEH wrap.
+	 * The function reads many fields off the instance descriptor
+	 * (param_1) at offsets up to 0x12c+.  Corrupted descriptors cause
+	 * any of those reads to fault.  The function ALREADY has multiple
+	 * `return 0` early-exit paths and the caller checks the return,
+	 * so SEH-catch + return 0 produces the same outcome the function
+	 * already produces for known-bad inputs: skip this instance,
+	 * continue the load. */
+	BYTE *pRestoreInst = base + RVA_RESTORE_INSTANCE;
+	LogBytes("RestoreInstance", pRestoreInst, 16);
+
+	if (pRestoreInst[0] != 0x55 || pRestoreInst[1] != 0x8B ||
+			pRestoreInst[2] != 0xEC || pRestoreInst[3] != 0x83 ||
+			pRestoreInst[4] != 0xE4 || pRestoreInst[5] != 0xF0)
+	{
+		Log("[MEMFIX] WARNING: RestoreInstance prologue mismatch! "
+				"Expected 55 8B EC 83 E4 F0, got %02X %02X %02X %02X %02X %02X\r\n",
+				pRestoreInst[0], pRestoreInst[1], pRestoreInst[2],
+				pRestoreInst[3], pRestoreInst[4], pRestoreInst[5]);
+		Log("[MEMFIX]   Hook 15 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkRestoreInst, pRestoreInst,
+										 (void *)Hook_RestoreInstance, STEAL_RESTORE_INSTANCE))
+		{
+			Log("[MEMFIX] FAILED to hook RestoreInstance\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked cdc::InstanceTable::RestoreInstance (SEH wrap)\r\n");
 		}
 	}
 
