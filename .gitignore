@@ -12,3 +12,6 @@
 /Debug/version.lib
 /Debug/version.pdb
 /DXHRDC_memoryAllocHookFix/Debug
+
+# Claude Code internal worktree state (do not commit)
+.claude/
