@@ -1128,6 +1128,77 @@ static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
 }
 
 /* ================================================================
+ * 9h. HOOK 11 — BuildDrmFilename (filename pointer sanitization)
+ *
+ * RVA 0x000a4240   __cdecl   void (char* outBuf, void* filename)
+ *
+ * This is a tiny one-liner wrapper:
+ *   _sprintf(outBuf, "%s%s.drm", &prefix, filename);
+ *
+ * It is reached during level-load instance restoration via:
+ *   FUN_0022ff60 (level loader)
+ *     → FUN_000ede40(idx)  [thin wrapper, idx = resource ID]
+ *       → LoadDrmResourceById (FUN_000edcc0)
+ *         → BuildDrmFilename(buf, table[idx*8])
+ *
+ * BUG (in both DC and original release — verified in dxhr.exe):
+ * LoadDrmResourceById has a broken bounds check that calls a handler
+ * but does NOT prevent the subsequent OOB read of table[idx*8] when
+ * idx is corrupted.  The OOB read produces a garbage "filename"
+ * pointer (e.g. 0x00001005) which is then passed to _sprintf, whose
+ * %s walker faults dereferencing it.  This is the actual crash at
+ * RVA 0x00641FDE in __output_l reading 0x1005.
+ *
+ * Our hook validates the filename pointer BEFORE _sprintf would
+ * walk it.  If invalid, write an empty string into the output buffer
+ * and return.  The caller (LoadDrmResourceById) then passes that
+ * empty path to FUN_001a7590, which fails to load the resource and
+ * leaves the cache slot at 0 — a recoverable state.
+ *
+ * Prologue (8 bytes stolen — two complete instructions):
+ *   000a4240  8B 44 24 08    MOV EAX, [ESP+8]   ; param_2 (filename)
+ *   000a4244  8B 4C 24 04    MOV ECX, [ESP+4]   ; param_1 (outBuf)
+ *
+ * __cdecl, returns void, RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_BUILDDRM 0x000a4240
+#define STEAL_BUILDDRM 8
+
+static HookCtx g_hkBuildDrm;
+static volatile LONG g_buildDrmRejects = 0;
+
+typedef void(__cdecl *OrigBuildDrm_t)(char *, void *);
+
+static void __cdecl Hook_BuildDrmFilename(char *outBuf, void *filename)
+{
+	/* Validate filename pointer.
+	 * A valid string pointer should be in user-mode address space
+	 * and point to readable memory.  Garbage values from OOB reads
+	 * (e.g. 0x00001005) get rejected here before _sprintf walks them. */
+	if (filename == NULL ||
+			(DWORD)(DWORD_PTR)filename < 0x10000 ||
+			(DWORD)(DWORD_PTR)filename > 0x7FFE0000 ||
+			IsBadReadPtr(filename, 1))
+	{
+		LONG n = InterlockedIncrement(&g_buildDrmRejects);
+		if (n <= 20)
+		{
+			/* Throttle log spam — first 20 rejections only */
+			Log("[MEMFIX] BuildDrmFilename: REJECTED bad filename ptr 0x%08X "
+					"(rejection #%ld)\r\n",
+					(unsigned)(DWORD_PTR)filename, n);
+		}
+		if (outBuf)
+			outBuf[0] = 0; /* empty string — caller will fail-load gracefully */
+		return;
+	}
+
+	OrigBuildDrm_t orig = (OrigBuildDrm_t)(g_hkBuildDrm.trampoline);
+	orig(outBuf, filename);
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1488,6 +1559,33 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked GetHeapCategoryName (pointer sanitization)\r\n");
+		}
+	}
+
+	/* Hook 11: BuildDrmFilename — sanitize filename pointer before _sprintf.
+	 * The actual crash at RVA 0x00641FDE (in statically-linked __output_l)
+	 * comes from this wrapper being called with a corrupted filename pointer
+	 * (e.g. 0x00001005) due to an OOB read in LoadDrmResourceById.  This
+	 * hook validates the pointer and substitutes an empty string when bad. */
+	BYTE *pBuildDrm = base + RVA_BUILDDRM;
+	LogBytes("BuildDrmFilen  ", pBuildDrm, 16);
+
+	if (pBuildDrm[0] != 0x8B || pBuildDrm[1] != 0x44 ||
+			pBuildDrm[2] != 0x24 || pBuildDrm[3] != 0x08)
+	{
+		Log("[MEMFIX] WARNING: BuildDrmFilename prologue mismatch! "
+				"Expected 8B 44 24 08, got %02X %02X %02X %02X\r\n",
+				pBuildDrm[0], pBuildDrm[1], pBuildDrm[2], pBuildDrm[3]);
+		Log("[MEMFIX]   Hook 11 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkBuildDrm, pBuildDrm,
+										 (void *)Hook_BuildDrmFilename, STEAL_BUILDDRM))
+		{
+			Log("[MEMFIX] FAILED to hook BuildDrmFilename\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked BuildDrmFilename (filename ptr sanitization)\r\n");
 		}
 	}
 
