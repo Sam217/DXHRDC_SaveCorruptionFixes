@@ -503,20 +503,6 @@ static void __cdecl Hook_GamePrintError(const char *fmt, ...)
 		return; /* <-- KEY: return instead of terminating */
 	}
 
-	/* Suppress "Can't open file" errors caused by Hook 11's filename-pointer
-	 * rejection.  When Hook 11 substitutes an empty string for a corrupted
-	 * filename pointer, the downstream resource loader (FUN_001a7590) fails
-	 * to open the file and the game calls GamePrintError("Can't open file %s",
-	 * "").  We treat that failure as recoverable: skip the missing resource
-	 * and let the game continue.  This is intentionally generic — if the
-	 * user's game install is genuinely corrupt we'll still log the error
-	 * but not terminate; the game will likely fail differently downstream. */
-	if (strstr(buf, "Can't open file") != NULL)
-	{
-		Log("[MEMFIX] *** FILE ERROR SUPPRESSED *** %s\r\n", buf);
-		return;
-	}
-
 	/* Non-OOM fatal error — replicate original behavior:
 	 * show the error and terminate.  We can't forward varargs
 	 * through the trampoline, so we do it directly. */
