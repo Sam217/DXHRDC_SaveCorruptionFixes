@@ -1469,6 +1469,83 @@ static int __cdecl Hook_FUN_001a4c80(unsigned int id)
 }
 
 /* ================================================================
+ * 9k. HOOK 14 — FUN_00065180 (SEH wrapper around vtable-deref crash)
+ *
+ * RVA 0x00065180   __thiscall   void (uint *stream)
+ *
+ * After the deserializer family at 0x25Bxxx-0x25Exxx (Hook 13's
+ * scope) finishes, the corrupted save advances into the next layer:
+ * an instance/object initializer that reads an index from the stream,
+ * looks up an object pointer in a table, and tail-calls a vtable
+ * function on it — with NO NULL guard:
+ *
+ *   FUN_00065180:
+ *     orig_FUN_00065020(this);              // state init
+ *     puVar2 = stream_read_u32(stream);     // index
+ *     this->field_0x154 = stream_read_u32(stream);
+ *     if ((int)puVar2 < 0) return;          // only filters signed-negative
+ *     piVar1 = *(int **)(this->table_at_0x18 + puVar2*4);
+ *     this->field_0x28  = piVar1;
+ *     this->field_0x15c = piVar1;
+ *     // ★ TAIL CALL: piVar1->vtable[+0x58](piVar1, stream)
+ *     //   crashes at MOV EDX,[ECX] when piVar1 is NULL — table entry
+ *     //   for the corrupted index is 0, no NULL check
+ *
+ * Crash registers: ECX=0 (NULL piVar1), reading [NULL+0] for vtable.
+ *
+ * Fix: __try/__except wrap the trampoline call.  The before-crash
+ * side effects (this->field_0x28 = NULL, this->field_0x15c = NULL)
+ * are actually beneficial — downstream code that reads those fields
+ * will see NULL and (hopefully) skip cleanly.  If a follow-up crash
+ * surfaces because some downstream code doesn't NULL-check those
+ * fields either, we patch that next.
+ *
+ * Tail-call analysis (vfunc returns directly to OUR hook's caller):
+ * The vfunc's RET 0x4 cleans the stream slot we pushed for orig.
+ * Our hook's epilogue RET 0x4 cleans the stream the caller pushed
+ * for us.  Both balanced; SEH unwinds cleanly to our handler.
+ *
+ * Prologue (5 bytes stolen — exactly four instructions):
+ *   00065180  53           PUSH EBX        (1 byte)
+ *   00065181  56           PUSH ESI        (1 byte)
+ *   00065182  57           PUSH EDI        (1 byte)
+ *   00065183  8B F1        MOV ESI, ECX    (2 bytes)
+ *
+ * __thiscall (this in ECX), 1 stack arg (stream), RET 0x4.
+ * Captured as __fastcall(this, edx_unused, stream).
+ * ================================================================ */
+
+#define RVA_FUN_65180 0x00065180
+#define STEAL_FUN_65180 5
+
+static HookCtx g_hkFun65180;
+static volatile LONG g_fun65180Catches = 0;
+
+typedef void(__fastcall *OrigFun65180_t)(void *this_, void *edx_,
+																				 unsigned int *stream);
+
+static void __fastcall Hook_FUN_00065180(void *this_, void *edx_,
+																				 unsigned int *stream)
+{
+	OrigFun65180_t orig = (OrigFun65180_t)(g_hkFun65180.trampoline);
+	__try
+	{
+		orig(this_, edx_, stream);
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LONG n = InterlockedIncrement(&g_fun65180Catches);
+		if (n <= 20)
+		{
+			Log("[MEMFIX] FUN_00065180: caught vtable NULL deref "
+					"(catch #%ld) — corrupt save object idx in stream\r\n",
+					n);
+		}
+		/* Function leaves this->field_0x28 = NULL, this->field_0x15c = NULL.
+		 * Downstream code should treat those as "no object" and skip. */
+	}
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1919,6 +1996,35 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked FUN_001a4c80 (caller-aware stub for FUN_0025e090)\r\n");
+		}
+	}
+
+	/* Hook 14: FUN_00065180 — SEH wrapper around the vtable-NULL-deref
+	 * crash in the layer immediately after the deserializer family.  The
+	 * function tail-calls a virtual function on a table-lookup result
+	 * with no NULL check; on bad save indices the lookup returns NULL
+	 * and the vtable load faults.  SEH catches and we return cleanly. */
+	BYTE *pFun65180 = base + RVA_FUN_65180;
+	LogBytes("FUN_00065180   ", pFun65180, 16);
+
+	if (pFun65180[0] != 0x53 || pFun65180[1] != 0x56 ||
+			pFun65180[2] != 0x57 || pFun65180[3] != 0x8B ||
+			pFun65180[4] != 0xF1)
+	{
+		Log("[MEMFIX] WARNING: FUN_00065180 prologue mismatch! "
+				"Expected 53 56 57 8B F1, got %02X %02X %02X %02X %02X\r\n",
+				pFun65180[0], pFun65180[1], pFun65180[2],
+				pFun65180[3], pFun65180[4]);
+		Log("[MEMFIX]   Hook 14 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkFun65180, pFun65180,
+										 (void *)Hook_FUN_00065180, STEAL_FUN_65180))
+		{
+			Log("[MEMFIX] FAILED to hook FUN_00065180\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked FUN_00065180 (SEH wrap for vtable NULL deref)\r\n");
 		}
 	}
 
