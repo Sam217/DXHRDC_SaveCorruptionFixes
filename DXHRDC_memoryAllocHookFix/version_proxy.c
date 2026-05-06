@@ -1206,6 +1206,102 @@ static void __cdecl Hook_BuildDrmFilename(char *outBuf, void *filename)
 }
 
 /* ================================================================
+ * 9i. HOOK 12 — LoadDrmResourceById (index validation at the source)
+ *
+ * RVA 0x000edcc0   __cdecl   void (int idx, int param_2)
+ *
+ * This is the function whose broken bounds check produces the bad
+ * filename pointer Hook 11 catches.  The original logic:
+ *
+ *   if (count < idx) FUN_000ed8f0();  // tries to reload+grow table
+ *   ECX = table[idx*8];               // OOB read if idx still > count
+ *   BuildDrmFilename(buf, ECX);       // garbage filename
+ *   FUN_001a7590(buf, ...);           // resource loader
+ *   *cache_slot = result;
+ *
+ * The bounds-check handler doesn't actually prevent the OOB read.
+ * Even after FUN_000ed8f0 reloads from objectlist.txt, the new count
+ * may still be < idx for a corrupted save, and the read proceeds
+ * regardless.
+ *
+ * Hook 12 validates idx against the table count BEFORE any of the
+ * function's logic runs.  If idx > count (or the table isn't yet
+ * initialized — early in startup), we log and return immediately.
+ * No cache slot is allocated, BuildDrmFilename and FUN_001a7590 are
+ * never called, and the engine's "assert via GamePrintError" path
+ * is never taken.
+ *
+ * Table layout (from FUN_000ed8f0 reverse-engineering):
+ *   [count, data_buf_ptr, entry0_ptr, entry0_id, entry1_ptr, entry1_id, ...]
+ * Count is 1-based; idx ∈ [1, count] is valid.
+ *
+ * Global indirection mirrors the original code:
+ *   table_ptr = *(int **)(base + 0x00a9a43c);  // first deref
+ *   count_struct = *(int **)((char *)table_ptr + 0x18);  // second deref
+ *   count = count_struct[0];
+ *
+ * Prologue (6 bytes stolen — exactly one instruction):
+ *   000edcc0  81 EC 04 01 00 00    SUB ESP, 0x104
+ *
+ * __cdecl, returns void, takes 2 stack args.  RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_LOADDRM 0x000edcc0
+#define STEAL_LOADDRM 6
+#define RVA_DAT_GLOBAL_TABLE_PP 0x00a9a43c
+
+static HookCtx g_hkLoadDrm;
+static volatile LONG g_loadDrmRejects = 0;
+
+typedef void(__cdecl *OrigLoadDrm_t)(int idx, int param_2);
+
+/* Helper: safely read the current resource-table count.
+ * Returns -1 if globals aren't initialized yet, in which case the
+ * caller should fall back to the original function. */
+static int SafeReadTableCount(BYTE *base)
+{
+	__try
+	{
+		int *tableStruct = *(int **)(base + RVA_DAT_GLOBAL_TABLE_PP);
+		if (tableStruct == NULL)
+			return -1;
+		int *countStruct = *(int **)((char *)tableStruct + 0x18);
+		if (countStruct == NULL)
+			return -1;
+		return *countStruct;
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return -1;
+	}
+}
+
+static void __cdecl Hook_LoadDrmResourceById(int idx, int param_2)
+{
+	BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+	int count = SafeReadTableCount(base);
+
+	/* Validate idx against current table count.
+	 * count == -1 means table not yet initialized → defer to original.
+	 * idx <= 0 is technically also invalid (count is 1-based) but the
+	 * original handles idx==0 in earlier hash-table walk logic, so we
+	 * only reject the OOB-high case here. */
+	if (count >= 0 && idx > count)
+	{
+		LONG n = InterlockedIncrement(&g_loadDrmRejects);
+		if (n <= 20)
+		{
+			Log("[MEMFIX] LoadDrmResourceById: REJECTED OOB idx %d "
+					"(count=%d, rejection #%ld)\r\n",
+					idx, count, n);
+		}
+		return; /* skip the entire function — no cache slot, no load */
+	}
+
+	OrigLoadDrm_t orig = (OrigLoadDrm_t)(g_hkLoadDrm.trampoline);
+	orig(idx, param_2);
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1593,6 +1689,36 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked BuildDrmFilename (filename ptr sanitization)\r\n");
+		}
+	}
+
+	/* Hook 12: LoadDrmResourceById — validate resource index at the source.
+	 * The engine's bounds check is broken (it tries to grow the table but
+	 * still reads OOB if the new count is still < idx).  This hook checks
+	 * idx against the current table count and skips the entire function
+	 * when idx is OOB, preventing the bad filename pointer from being
+	 * constructed in the first place. */
+	BYTE *pLoadDrm = base + RVA_LOADDRM;
+	LogBytes("LoadDrmResId   ", pLoadDrm, 16);
+
+	if (pLoadDrm[0] != 0x81 || pLoadDrm[1] != 0xEC ||
+			pLoadDrm[2] != 0x04 || pLoadDrm[3] != 0x01 ||
+			pLoadDrm[4] != 0x00 || pLoadDrm[5] != 0x00)
+	{
+		Log("[MEMFIX] WARNING: LoadDrmResourceById prologue mismatch! "
+				"Expected 81 EC 04 01 00 00, got %02X %02X %02X %02X %02X %02X\r\n",
+				pLoadDrm[0], pLoadDrm[1], pLoadDrm[2],
+				pLoadDrm[3], pLoadDrm[4], pLoadDrm[5]);
+		Log("[MEMFIX]   Hook 12 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLoadDrm, pLoadDrm,
+										 (void *)Hook_LoadDrmResourceById, STEAL_LOADDRM))
+		{
+			Log("[MEMFIX] FAILED to hook LoadDrmResourceById\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked LoadDrmResourceById (idx validation)\r\n");
 		}
 	}
 
