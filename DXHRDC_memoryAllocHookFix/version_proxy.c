@@ -1128,76 +1128,6 @@ static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
 }
 
 /* ================================================================
- * 9g. HOOK 10 — Direct dlmalloc wrapper (Path B fallback)
- *
- * RVA 0x001fe4e0   __thiscall   int (int size, undefined4 extra)
- *
- * This function calls cdc::dlmalloc DIRECTLY, bypassing our hooked
- * MemHeapAllocator::Allocate.  When dlmalloc fails, it returns NULL
- * to the caller, which then tries to log the error using a different
- * error path (not GamePrintError), crashing on corrupted args.
- *
- * Our hook adds VirtualAlloc fallback — same strategy as Hook 2.
- *
- * Prologue (5 bytes stolen):
- *   001fe4e0  53               PUSH EBX
- *   001fe4e1  56               PUSH ESI
- *   001fe4e2  8B F1            MOV ESI, ECX  (partially — 3rd byte)
- *
- * Actually we need 6 bytes for two complete instructions:
- *   001fe4e0  53               PUSH EBX       (1 byte)
- *   001fe4e1  56               PUSH ESI       (1 byte)
- *   001fe4e2  8B F1            MOV ESI, ECX   (2 bytes)
- *   001fe4e4  57               PUSH EDI       (1 byte)
- *   → 5 bytes = PUSH EBX + PUSH ESI + MOV ESI,ECX + PUSH EDI
- *     but JMP rel32 needs 5 bytes, and PUSH EBX(1)+PUSH ESI(1)+MOV ESI,ECX(2)=4
- *     We need at least 5: steal PUSH EBX+PUSH ESI+MOV ESI,ECX+PUSH EDI = 5 bytes
- *
- * Returns int (pointer).  RET 0x8 (callee cleans 2 stack args).
- * ================================================================ */
-
-#define RVA_DIRECTMALLOC 0x001fe4e0
-#define STEAL_DIRECTMALLOC 5
-
-static HookCtx g_hkDirectMalloc;
-
-typedef int(__fastcall *OrigDirectMalloc_t)(void *, void *, int, int);
-
-static int __fastcall Hook_DirectMalloc(void *this_, void *edx_,
-																				int size, int extra)
-{
-	OrigDirectMalloc_t orig = (OrigDirectMalloc_t)(g_hkDirectMalloc.trampoline);
-	int result = orig(this_, edx_, size, extra);
-
-	if (result == 0 && size > 0)
-	{
-		/* Reject insane sizes */
-		if (size < 0 || (MAX_SANE_ALLOC_SIZE > 0 &&
-										 (unsigned)size > MAX_SANE_ALLOC_SIZE))
-		{
-			Log("[MEMFIX] DirectMalloc: REJECTED insane size %d\r\n", size);
-			return 0;
-		}
-
-		void *fb = VirtualAlloc(NULL, (SIZE_T)(unsigned int)size,
-														MEM_COMMIT | MEM_RESERVE,
-														PAGE_READWRITE);
-		if (fb)
-		{
-			TrackAdd(fb, (SIZE_T)(unsigned int)size);
-			result = (int)(DWORD_PTR)fb;
-			Log("[MEMFIX] FALLBACK: DirectMalloc(%u) -> 0x%08X\r\n",
-					(unsigned)size, result);
-		} else
-		{
-			Log("[MEMFIX] FALLBACK FAILED: DirectMalloc(%u) err=%u\r\n",
-					(unsigned)size, GetLastError());
-		}
-	}
-	return result;
-}
-
-/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1558,32 +1488,6 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked GetHeapCategoryName (pointer sanitization)\r\n");
-		}
-	}
-
-	/* Hook 10: Direct dlmalloc wrapper (FUN_001fe4e0) — Path B fallback.
-	 * This function calls dlmalloc directly, bypassing our hooked Allocate.
-	 * Without this hook, failed allocations on Path B return NULL and the
-	 * caller crashes.  We add the same VirtualAlloc fallback as Hook 2. */
-	BYTE *pDirect = base + RVA_DIRECTMALLOC;
-	LogBytes("DirectMalloc   ", pDirect, 16);
-
-	if (pDirect[0] != 0x53 || pDirect[1] != 0x56 ||
-			pDirect[2] != 0x8B || pDirect[3] != 0xF1)
-	{
-		Log("[MEMFIX] WARNING: DirectMalloc prologue mismatch! "
-				"Expected 53 56 8B F1, got %02X %02X %02X %02X\r\n",
-				pDirect[0], pDirect[1], pDirect[2], pDirect[3]);
-		Log("[MEMFIX]   Hook 10 SKIPPED\r\n");
-	} else
-	{
-		if (!InstallHook(&g_hkDirectMalloc, pDirect,
-										 (void *)Hook_DirectMalloc, STEAL_DIRECTMALLOC))
-		{
-			Log("[MEMFIX] FAILED to hook DirectMalloc\r\n");
-		} else
-		{
-			Log("[MEMFIX] [OK] Hooked DirectMalloc (Path B fallback)\r\n");
 		}
 	}
 
