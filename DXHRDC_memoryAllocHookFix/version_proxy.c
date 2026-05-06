@@ -72,6 +72,7 @@
 #include <string.h>
 #include <tlhelp32.h>
 #include <windows.h>
+#include <intrin.h> /* _ReturnAddress() — Hook 13 caller-site detection */
 
 /* ================================================================
  * 1. VERSION.DLL FORWARDING
@@ -1355,6 +1356,97 @@ static void __cdecl Hook_LoadDrmResourceById(int idx, int param_2)
 }
 
 /* ================================================================
+ * 9j. HOOK 13 — FUN_001a4c80 (caller-aware safe stub)
+ *
+ * RVA 0x001a4c80   __cdecl   int (uint id)
+ *
+ * FUN_001a4c80 is a tiny global-table lookup:
+ *   if (id < 0x18000 && DAT_015806e8[id] != NULL && entry->flag == 0)
+ *     return entry + 0x10;
+ *   return 0;
+ *
+ * 100+ callers throughout the engine.  Most check the NULL return
+ * cleanly and skip the missing entry.  ONE caller — FUN_0025e090 —
+ * has the engine's classic check-then-deref-anyway bug:
+ *
+ *   puVar8 = FUN_001a4c80(uVar12);
+ *   if (puVar8 != NULL) {
+ *       uVar9 = *puVar8;
+ *       ... loop guarded by puVar8 ...
+ *       if (uVar9 <= uVar10 || uVar10 < 0) goto SKIP;
+ *   }
+ *   if (*(int *)(uVar10*0x5c + 0x18 + puVar8[1]) != 0) {  ← puVar8[1] derefed
+ *       ...                                                  ← outside the guard!
+ *
+ * When FUN_001a4c80 returns NULL (corrupted save references unknown id)
+ * and execution falls through, puVar8[1] = NULL+4 = 0x4 → access
+ * violation.  Same shape as LoadDrmResourceById's broken bounds check.
+ *
+ * We can't change FUN_001a4c80's NULL semantic globally (would break
+ * legitimate "is this entry present?" callers).  Instead, the hook
+ * checks the return address: if the call originated from inside
+ * FUN_0025e090 [0x25E090, 0x25E385) AND the lookup missed, return a
+ * pointer to a static {0, 0} stub.  With *stub == 0 the function's
+ * inner loop is skipped and the OR condition succeeds (0 <= 0),
+ * triggering goto LAB_0025e242 BEFORE the buggy puVar8[1] deref.
+ *
+ * Original returns entry+0x10 — the stub is shaped accordingly:
+ * pointer to a 2-uint zero array means stub[0]=0 (count), stub[1]=0
+ * (only read inside the loop body which is skipped when count==0).
+ *
+ * Prologue (9 bytes stolen — two complete instructions):
+ *   001a4c80  8B 44 24 04          MOV EAX, [ESP+4]        (4 bytes)
+ *   001a4c84  3D 00 80 01 00       CMP EAX, 0x18000        (5 bytes)
+ *
+ * __cdecl, returns int, takes 1 stack arg.  RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_LOOKUP 0x001a4c80
+#define STEAL_LOOKUP 9
+#define RVA_FUN_0025E090_START 0x0025e090
+#define RVA_FUN_0025E090_END 0x0025e385 /* exclusive */
+
+static HookCtx g_hkLookup;
+static volatile LONG g_lookupStubs = 0;
+
+/* Static stub returned to FUN_0025e090 on lookup miss.
+ * stub[0] is read as "count" (must be 0 to skip the loop body).
+ * stub[1] is dereferenced inside the loop body which won't run. */
+static unsigned int g_lookupStub[2] = {0, 0};
+
+typedef int(__cdecl *OrigLookup_t)(unsigned int id);
+
+static int __cdecl Hook_FUN_001a4c80(unsigned int id)
+{
+	OrigLookup_t orig = (OrigLookup_t)(g_hkLookup.trampoline);
+	int result = orig(id);
+
+	if (result == 0)
+	{
+		/* MSVC intrinsic — return address of the call into our hook. */
+		DWORD ra = (DWORD)(DWORD_PTR)_ReturnAddress();
+		BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+		DWORD bugStart = (DWORD)(DWORD_PTR)(base + RVA_FUN_0025E090_START);
+		DWORD bugEnd = (DWORD)(DWORD_PTR)(base + RVA_FUN_0025E090_END);
+
+		if (ra >= bugStart && ra < bugEnd)
+		{
+			LONG n = InterlockedIncrement(&g_lookupStubs);
+			if (n <= 20)
+			{
+				Log("[MEMFIX] FUN_001a4c80: substituted safe stub for "
+						"FUN_0025e090 lookup (id=%u, RA=0x%08X, "
+						"substitution #%ld)\r\n",
+						id, (unsigned)ra, n);
+			}
+			return (int)(DWORD_PTR)g_lookupStub;
+		}
+	}
+
+	return result;
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -1772,6 +1864,39 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked LoadDrmResourceById (idx validation)\r\n");
+		}
+	}
+
+	/* Hook 13: FUN_001a4c80 — caller-aware safe stub for FUN_0025e090.
+	 * Substitutes a static {0,0} stub when the lookup misses AND the
+	 * caller is inside FUN_0025e090's body, sidestepping that function's
+	 * check-then-deref-anyway NULL bug.  All other 100+ callers see the
+	 * unchanged NULL return. */
+	BYTE *pLookup = base + RVA_LOOKUP;
+	LogBytes("FUN_001a4c80   ", pLookup, 16);
+
+	if (pLookup[0] != 0x8B || pLookup[1] != 0x44 ||
+			pLookup[2] != 0x24 || pLookup[3] != 0x04 ||
+			pLookup[4] != 0x3D || pLookup[5] != 0x00 ||
+			pLookup[6] != 0x80 || pLookup[7] != 0x01 ||
+			pLookup[8] != 0x00)
+	{
+		Log("[MEMFIX] WARNING: FUN_001a4c80 prologue mismatch! "
+				"Expected 8B 44 24 04 3D 00 80 01 00, got "
+				"%02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+				pLookup[0], pLookup[1], pLookup[2], pLookup[3],
+				pLookup[4], pLookup[5], pLookup[6], pLookup[7],
+				pLookup[8]);
+		Log("[MEMFIX]   Hook 13 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLookup, pLookup,
+										 (void *)Hook_FUN_001a4c80, STEAL_LOOKUP))
+		{
+			Log("[MEMFIX] FAILED to hook FUN_001a4c80\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked FUN_001a4c80 (caller-aware stub for FUN_0025e090)\r\n");
 		}
 	}
 
