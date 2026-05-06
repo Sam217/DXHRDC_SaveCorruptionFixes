@@ -1366,33 +1366,40 @@ static void __cdecl Hook_LoadDrmResourceById(int idx, int param_2)
  *   return 0;
  *
  * 100+ callers throughout the engine.  Most check the NULL return
- * cleanly and skip the missing entry.  ONE caller — FUN_0025e090 —
- * has the engine's classic check-then-deref-anyway bug:
+ * cleanly and skip the missing entry.  An entire family of save
+ * deserializers at RVA 0x25Bxxx..0x25Exxx all share the engine's
+ * classic check-then-deref-anyway (or no-check-at-all) bug.
+ * Confirmed instances:
  *
- *   puVar8 = FUN_001a4c80(uVar12);
- *   if (puVar8 != NULL) {
- *       uVar9 = *puVar8;
- *       ... loop guarded by puVar8 ...
- *       if (uVar9 <= uVar10 || uVar10 < 0) goto SKIP;
- *   }
- *   if (*(int *)(uVar10*0x5c + 0x18 + puVar8[1]) != 0) {  ← puVar8[1] derefed
- *       ...                                                  ← outside the guard!
+ *   FUN_0025cb50:                              FUN_0025e090 (excerpt):
+ *     piVar3 = FUN_001a4c80(param_1);            puVar8 = FUN_001a4c80(uVar12);
+ *     if (piVar3[6] != 0) { ... }                if (puVar8 != NULL) {
+ *     ↑ piVar3[6] = NULL+0x18 → CRASH                uVar9 = *puVar8;  // safe
+ *                                                    if (uVar9 != 0) ...
+ *                                                    if (uVar9 <= uVar10) goto SKIP;
+ *                                                }
+ *                                                // ★ falls through with puVar8 NULL
+ *                                                if (*(... + puVar8[1]) != 0) {
+ *                                                ↑ puVar8[1] = NULL+0x04 → CRASH
  *
- * When FUN_001a4c80 returns NULL (corrupted save references unknown id)
- * and execution falls through, puVar8[1] = NULL+4 = 0x4 → access
- * violation.  Same shape as LoadDrmResourceById's broken bounds check.
+ * Other callers in the family (FUN_0025bb50, _25c580, _25dcc0,
+ * _25de90, _25df50, _25e010, _25e390) almost certainly have the
+ * same shape.  When the corrupted save references unknown ids,
+ * any of them can crash.
  *
- * We can't change FUN_001a4c80's NULL semantic globally (would break
- * legitimate "is this entry present?" callers).  Instead, the hook
- * checks the return address: if the call originated from inside
- * FUN_0025e090 [0x25E090, 0x25E385) AND the lookup missed, return a
- * pointer to a static {0, 0} stub.  With *stub == 0 the function's
- * inner loop is skipped and the OR condition succeeds (0 <= 0),
- * triggering goto LAB_0025e242 BEFORE the buggy puVar8[1] deref.
+ * We can't change FUN_001a4c80's NULL semantic globally (would
+ * break the 90+ legitimate "is this entry present?" callers
+ * outside the deserializer family).  Instead, the hook checks
+ * the return address: if the call originated from inside the
+ * deserializer family RA range AND the lookup missed, return a
+ * pointer to a static 16-uint zero stub.  With all-zero values:
  *
- * Original returns entry+0x10 — the stub is shaped accordingly:
- * pointer to a 2-uint zero array means stub[0]=0 (count), stub[1]=0
- * (only read inside the loop body which is skipped when count==0).
+ *   - FUN_0025cb50: piVar3[6]==0 → skip the loop body → return
+ *   - FUN_0025e090: *puVar8==0, puVar8[1]==0... but the buggy
+ *     deref is taken via OR-shortcircuit (0<=0) goto SKIP first
+ *
+ * The stub is sized at 16 uints (64 bytes) to absorb common
+ * piVar3[N] access patterns for small N without OOB.
  *
  * Prologue (9 bytes stolen — two complete instructions):
  *   001a4c80  8B 44 24 04          MOV EAX, [ESP+4]        (4 bytes)
@@ -1403,16 +1410,31 @@ static void __cdecl Hook_LoadDrmResourceById(int idx, int param_2)
 
 #define RVA_LOOKUP 0x001a4c80
 #define STEAL_LOOKUP 9
-#define RVA_FUN_0025E090_START 0x0025e090
-#define RVA_FUN_0025E090_END 0x0025e385 /* exclusive */
+
+/* The save-deserializer family at RVA 0x25Bxxx..0x25Exxx all call
+ * FUN_001a4c80 to look up game-object data by id and all share the
+ * same engine bug — they dereference the result with no NULL guard
+ * (or only a partial guard).  Confirmed at least:
+ *   FUN_0025cb50  →  piVar3[6]    (NULL + 0x18 → crash)
+ *   FUN_0025e090  →  puVar8[1]    (NULL + 0x04 → crash)
+ * Other callers in the family (FUN_0025bb50, _25c580, _25dcc0,
+ * _25de90, _25df50, _25e010, _25e390) almost certainly have the
+ * same shape.  Cheaper to substitute the stub for the whole family
+ * than to chase each function individually. */
+#define RVA_DESERIALIZER_FAMILY_START 0x0025b000
+#define RVA_DESERIALIZER_FAMILY_END 0x00260000 /* exclusive */
 
 static HookCtx g_hkLookup;
 static volatile LONG g_lookupStubs = 0;
 
-/* Static stub returned to FUN_0025e090 on lookup miss.
- * stub[0] is read as "count" (must be 0 to skip the loop body).
- * stub[1] is dereferenced inside the loop body which won't run. */
-static unsigned int g_lookupStub[2] = {0, 0};
+/* Static stub returned to deserializer-family callers on lookup miss.
+ * Sized at 16 uints (64 bytes) so common access patterns like
+ * piVar3[N] for small N read zero instead of OOB.  Confirmed safe
+ * uses so far: stub[0] (count), stub[1] (ptr to inner array — only
+ * read when count > 0, which is false for our stub), stub[6] (count
+ * in FUN_0025cb50).  Padding to 16 covers other plausible offsets
+ * we haven't seen yet. */
+static unsigned int g_lookupStub[16] = {0};
 
 typedef int(__cdecl *OrigLookup_t)(unsigned int id);
 
@@ -1426,18 +1448,18 @@ static int __cdecl Hook_FUN_001a4c80(unsigned int id)
 		/* MSVC intrinsic — return address of the call into our hook. */
 		DWORD ra = (DWORD)(DWORD_PTR)_ReturnAddress();
 		BYTE *base = (BYTE *)GetModuleHandleA(NULL);
-		DWORD bugStart = (DWORD)(DWORD_PTR)(base + RVA_FUN_0025E090_START);
-		DWORD bugEnd = (DWORD)(DWORD_PTR)(base + RVA_FUN_0025E090_END);
+		DWORD famStart = (DWORD)(DWORD_PTR)(base + RVA_DESERIALIZER_FAMILY_START);
+		DWORD famEnd = (DWORD)(DWORD_PTR)(base + RVA_DESERIALIZER_FAMILY_END);
 
-		if (ra >= bugStart && ra < bugEnd)
+		if (ra >= famStart && ra < famEnd)
 		{
 			LONG n = InterlockedIncrement(&g_lookupStubs);
 			if (n <= 20)
 			{
 				Log("[MEMFIX] FUN_001a4c80: substituted safe stub for "
-						"FUN_0025e090 lookup (id=%u, RA=0x%08X, "
+						"deserializer call (id=%u, RA=0x%08X = RVA 0x%08X, "
 						"substitution #%ld)\r\n",
-						id, (unsigned)ra, n);
+						id, (unsigned)ra, (unsigned)(ra - (DWORD)(DWORD_PTR)base), n);
 			}
 			return (int)(DWORD_PTR)g_lookupStub;
 		}
