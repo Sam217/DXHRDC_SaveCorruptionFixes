@@ -1112,12 +1112,14 @@ static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
 	/* Validate the returned pointer.
 	 * A valid string pointer should be:
 	 * - Non-null
-	 * - In a reasonable memory range (above 0x10000, below 0x7FFE0000)
+	 * - Above 0x10000 (NULL page is reserved on Windows)
+	 * - Below 0xFFFEFFFF (kernel reserves top page;
+	 *     DXHRDC.exe is /LARGEADDRESSAWARE so user-mode reaches ~4 GB)
 	 * - Readable (at least the first byte)
 	 * Invalid pointers like 0x00001005 will be caught here. */
 	if (result == NULL ||
 			(DWORD)(DWORD_PTR)result < 0x10000 ||
-			(DWORD)(DWORD_PTR)result > 0x7FFE0000 ||
+			(DWORD)(DWORD_PTR)result > 0xFFFEFFFF ||
 			IsBadReadPtr(result, 1))
 	{
 		/* Return a safe string instead of the garbage pointer */
@@ -1175,10 +1177,15 @@ static void __cdecl Hook_BuildDrmFilename(char *outBuf, void *filename)
 	/* Validate filename pointer.
 	 * A valid string pointer should be in user-mode address space
 	 * and point to readable memory.  Garbage values from OOB reads
-	 * (e.g. 0x00001005) get rejected here before _sprintf walks them. */
+	 * (e.g. 0x00001005) get rejected here before _sprintf walks them.
+	 *
+	 * NOTE: DXHRDC.exe is /LARGEADDRESSAWARE so on 64-bit Windows the
+	 * user-mode range goes up to ~0xFFFEFFFF (almost 4 GB), not the
+	 * standard 2 GB.  The earlier 0x7FFE0000 bound was rejecting valid
+	 * high-heap pointers (e.g. 0x81C5D5B5 observed at startup). */
 	if (filename == NULL ||
 			(DWORD)(DWORD_PTR)filename < 0x10000 ||
-			(DWORD)(DWORD_PTR)filename > 0x7FFE0000 ||
+			(DWORD)(DWORD_PTR)filename > 0xFFFEFFFF ||
 			IsBadReadPtr(filename, 1))
 	{
 		LONG n = InterlockedIncrement(&g_buildDrmRejects);
