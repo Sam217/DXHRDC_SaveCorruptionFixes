@@ -43,7 +43,7 @@ import sys
 import time
 import zlib
 
-# Default in-repo locations (junction → Steam userdata).
+# Default in-repo locations (junction -> Steam userdata).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 DEFAULT_SAVES_DIR = os.path.join(REPO_ROOT, "238010", "remote")
@@ -189,11 +189,11 @@ def main():
 
     bak = backup_file(output_path)
     if bak:
-        print(f"Backed up existing {args.output} → {os.path.basename(bak)}")
+        print(f"Backed up existing {args.output} -> {os.path.basename(bak)}")
     else:
         print(f"No existing {args.output} to back up (will create new file).")
 
-    print(f"Writing hybrid → {output_path}")
+    print(f"Writing hybrid -> {output_path}")
     write_save(output_path, hybrid)
     print(f"  wrote {os.path.getsize(output_path):,} compressed bytes")
     print()
