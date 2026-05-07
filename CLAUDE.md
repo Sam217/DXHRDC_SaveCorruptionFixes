@@ -13,8 +13,10 @@ A Windows `version.dll` proxy that hooks the engine of *Deus Ex: Human Revolutio
 - **15 hooks installed** (1, 2, 3, 4, 5-fixed, 6, 7, 8, 9-LAA-fixed, 11, 12, 13, 14, 15). Hook 10 was removed as redundant.
 - **GAMER23_4 (the late-Missing-Link save) now loads** — into a degraded state (no HUD, broken inventory/aug menus) but no longer crashes the process.
 - **Save format mostly mapped**: zlib-compressed → fixed `0x23A000`-byte buffer; first 960 KB is player progression (99.98% identical between same-chapter saves); remaining 1.4 MB is per-session world state where corruption lives.
-- **Repair tool feasibility is high** — see SUMMARY §10.
+- **Hybrid graft experiment FAILED** (SUMMARY §11.1). Crashed at RVA `0x0020845E` with NULL+0xD8 deref, completely new crash chain, no hooks fired. **Progression header and world state are NOT independent** — they cross-reference each other. The hybrid created an inconsistent save: GAMER23 progression says "end of Missing Link" + GAMER63 world says "ship deck" → looked-up table is NULL.
+- **Surgical patch is the next move**: take GAMER23 untouched, find uint32s in stack-address range (`0x02000000-0x0FFFFFFF`) within the world-state region (`0xF0000+`), overwrite with `0`. Same semantic as Hook 5's stream-exhaustion bailout, applied at the file level.
 - The corruption mechanism is "uninitialized stack memory leaks into `InstanceTable->field_0x14` at save time, writer faithfully serializes garbage, loader trusts it" (SUMMARY §10.4). Likely correlates with non-lethal-takedown / accumulated ragdoll state.
+- `pythonSaveRepair/save_repair_tool.py` exists with hybrid mode (now non-viable). Needs `--mode=patch` for the surgical approach.
 
 ## Standing instructions from the user
 
