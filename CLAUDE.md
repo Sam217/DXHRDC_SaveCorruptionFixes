@@ -4,9 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A Windows `version.dll` proxy that hooks the engine of *Deus Ex: Human Revolution — Director's Cut* (DXHRDC.exe, 32-bit) to fix save-load crashes after ~30 hours of gameplay. The shipped engine is a Crystal Dynamics console port with a 512 MB hardcoded dlmalloc pool and several deserialization functions that mishandle corrupted save data. Goal: load corrupted saves, discard the bad fields, keep player progression/inventory.
+A Windows `version.dll` proxy that hooks the engine of *Deus Ex: Human Revolution — Director's Cut* (DXHRDC.exe, 32-bit) to fix save-load crashes after ~30 hours of gameplay. The shipped engine is a Crystal Dynamics console port with a 512 MB hardcoded dlmalloc pool and many deserialization functions that mishandle corrupted save data. Goal: load corrupted saves, discard the bad fields, keep player progression/inventory.
 
-**The exhaustive context is in [SUMMARY.md](../../../SUMMARY.md)** (in the parent repo root, ~30 KB). Read it before making any non-trivial change — it documents 10 hooks, 9 versions, the allocator architecture, the discovered game bugs, and the current known crash.
+**The exhaustive context is in [SUMMARY.md](../../../SUMMARY.md)** (in the parent repo root, ~70 KB). Read it before making any non-trivial change — it documents the full hook list (15 active, 1 removed), the allocator architecture, discovered game bugs, the save format reverse-engineering, and the current known state.
+
+### Current state (2026-05-07)
+
+- **15 hooks installed** (1, 2, 3, 4, 5-fixed, 6, 7, 8, 9-LAA-fixed, 11, 12, 13, 14, 15). Hook 10 was removed as redundant.
+- **GAMER23_4 (the late-Missing-Link save) now loads** — into a degraded state (no HUD, broken inventory/aug menus) but no longer crashes the process.
+- **Save format mostly mapped**: zlib-compressed → fixed `0x23A000`-byte buffer; first 960 KB is player progression (99.98% identical between same-chapter saves); remaining 1.4 MB is per-session world state where corruption lives.
+- **Repair tool feasibility is high** — see SUMMARY §10.
+- The corruption mechanism is "uninitialized stack memory leaks into `InstanceTable->field_0x14` at save time, writer faithfully serializes garbage, loader trusts it" (SUMMARY §10.4). Likely correlates with non-lethal-takedown / accumulated ragdoll state.
 
 ## Standing instructions from the user
 
@@ -61,15 +69,64 @@ Hooks 2/3 cover Path A. Hook 10 covers Path B. Hook 1 suppresses `GamePrintError
 
 ### Deserialization hooks (the targeted fixes)
 
-- **Hook 8 — `Hud::LoadActiveGroups` (0x0041e080)** is a complete reimplementation of a known-buggy game function whose `while(true)` loop never terminates on truncated streams. This is the model to follow for future fixes: identify the buggy deserializer, write a corrected version that calls back into the game's helpers (`PushActiveGroup` at 0x0041de80, etc.).
-- Hooks 5/6/7 cap counts (50000 instances, 100000 array elements). They are blunter — useful to prevent runaway growth but may also reject legitimate large arrays.
-- Hook 9 sanitizes `GetHeapCategoryName` return values so the printf path doesn't crash on a bad pointer.
+Three hook patterns we've used (and rough rules for which to use):
+
+1. **Input-validation hook** (Hook 12 model). The hooked function reads
+   a value (an index, an id, etc.); validate the value upfront against
+   a known constraint and early-return on rejection. Best when the
+   constraint is cheap to compute (table count via known global, etc.).
+
+2. **Caller-aware substitution** (Hook 13 model). Hook a leaf function
+   that has many legitimate callers; use `_ReturnAddress()` to detect
+   calls from a specific buggy region and substitute a safe stub for
+   those calls only. Other callers see unchanged behavior. Best when
+   you can't change the function's global semantic but a specific code
+   region needs different behavior.
+
+3. **SEH wrap** (Hook 14 / Hook 15 model). Wrap the trampoline call in
+   `__try/__except (EXCEPTION_EXECUTE_HANDLER)`; on fault log and
+   return a sane default (e.g., 0 = "operation failed cleanly"). Best
+   when the function already has multiple early-exit paths the caller
+   handles, *or* when the bug is too tangled to validate inputs without
+   reproducing the function's logic.
+
+4. **Complete reimplementation** (Hook 8 model). Replace the function's
+   body with a corrected version that calls back into the game's
+   helpers. Best when the bug is a structural issue (infinite loop) and
+   the function is small enough.
+
+Specific hooks:
+- **Hook 8** — `Hud::LoadActiveGroups` (RVA 0x0041e080) reimplements a
+  `while(true)` loop that never terminates on truncated streams.
+- **Hook 5** — caps the instance-table loop count, AND (post-fix in
+  commit `fcb20dd`) early-returns when the stream can't fit the
+  flag+count header (otherwise the original engine uses an
+  uninitialized stack variable as the loop counter → 45M+ iterations).
+- **Hooks 6/7** — blanket caps for `DynArray_PushBack_8bytes` and
+  `DynArray4_PushBack` at 100000 elements. Blunt but bounded.
+- **Hook 9** — `GetHeapCategoryName` sanitization (with LAA-correct
+  upper bound `0xFFFEFFFF`).
+- **Hook 11** — `BuildDrmFilename` filename-pointer sanitization (last
+  line of defense against `_sprintf` walking garbage).
+- **Hook 12** — `LoadDrmResourceById` index AND entry-value validation.
+  The actual fix for the `0x1005` crash signature.
+- **Hook 13** — caller-aware stub for `FUN_001a4c80` (covers the
+  deserializer family at RVA 0x25Bxxx-0x25Exxx).
+- **Hook 14** — SEH wrap around `FUN_00065180` (vtable-NULL deref).
+- **Hook 15** — SEH wrap around
+  `cdc::InstanceTable::RestoreInstance`. Reads many fields off a
+  potentially-corrupt descriptor; SEH-catch returns 0 (function's own
+  "give up on this instance" code).
 
 ### Key RVAs (verify in Ghidra before relying on them)
 
-Allocator: `0x1fbc60` GamePrintError · `0x1fb660` GetHeapCategoryName · `0x1fdcc0` Allocate · `0x1fde30` AllocateAligned · `0x1fe010` Free · `0x1fe4e0` direct-dlmalloc wrapper · `0x1fcf90` dlmalloc · `0x1fcc00` dlfree · `0x1fce00` dlmalloc_GrowHeap · `0x2028b0` OSHeap::Init · `0x2029d0` OSHeap::sbrk.
+Allocator: `0x1fbc60` GamePrintError · `0x1fb660` GetHeapCategoryName · `0x1fdcc0` Allocate · `0x1fde30` AllocateAligned · `0x1fe010` Free · `0x1fe4e0` MemHeapAllocator::PrimaryAlloc (was misnamed "Path B" in old SUMMARY) · `0x1fcf90` dlmalloc · `0x1fcc00` dlfree · `0x1fce00` dlmalloc_GrowHeap · `0x2028b0` OSHeap::Init · `0x2029d0` OSHeap::sbrk.
 
-Deserialization: `0x0eceb0` InstanceTable::LoadFromStream · `0x41e080` Hud::LoadActiveGroups · `0x41de80` Hud::PushActiveGroup · `0x14ec40` DynArray4_PushBack · `0x2b0dd0` DynArray_PushBack_8bytes · `0x1385c0` ArrayCopyElements.
+Deserialization: `0x0eceb0` InstanceTable::LoadFromStream · `0x0ecc00` InstanceTable::SaveToStream · `0x0ecc80` InstanceTable::RestoreInstance · `0x41e080` Hud::LoadActiveGroups · `0x41de80` Hud::PushActiveGroup · `0x14ec40` DynArray4_PushBack · `0x2b0dd0` DynArray_PushBack_8bytes · `0x1385c0` ArrayCopyElements.
+
+Resource lookup chain: `0x000a4240` BuildDrmFilename · `0x000edcc0` LoadDrmResourceById · `0x001a4c80` (lookup-by-id, 100+ callers) · `0x000ed8f0` (table reload from objectlist.txt).
+
+Save system: `0x00408bb0` save-system command dispatcher (string verbs: `LoadExistingSavedGame`, `SaveNewGame`, `OverwriteExistingGame`, ...) · `0x0033cdd0` save-load state machine (allocates `0x23A000` buffer).
 
 ### Worktrees
 
@@ -82,3 +139,27 @@ The user works inside git worktrees at `.claude/worktrees/<name>/`. The worktree
 - Capture `__thiscall` from C as `__fastcall(void* this_, void* edx_unused, ...)`.
 - VirtualAlloc returns page-aligned (4096) memory — satisfies any game alignment requirement.
 - `__try/__except` and `va_list` cannot live in the same function on MSVC; split into a helper.
+- DXHRDC.exe is `/LARGEADDRESSAWARE` — user-mode addresses span up to `0xFFFEFFFF`, NOT `0x7FFFFFFF`. Use the wider bound when validating pointers.
+
+## Save format reference
+
+PC saves at `<SteamDir>/userdata/<userid>/238010/remote/`. The user has set up a junction at `<repoRoot>/238010/` so saves are accessible from the repo. Naming: `GAMER##_4` (player slots 1–99), `GAMEA1_4` (autosave), `GAMEQ1_4` (quicksave). The `_4` suffix is the language code (English).
+
+Format quick reference:
+- **zlib-compressed** (magic `78 9C`).
+- Decompressed size: **fixed `0x23A000` = 2,334,720 bytes**. Matches the engine's `FUN_001ac850(0x23a000)` allocation.
+- **No encryption, no checksum/signature.**
+- **First 960 KB (`0x000000–0x0F0000`)** = player progression header (XP, augs, story flags, base inventory). Stable between consecutive saves in the same chapter (≪200 byte diff observed).
+- **Remaining 1.4 MB (`0x0F0000` onward)** = per-session world state (instances, NPC positions, ragdolls). High variation between saves; **this is where the corruption lives.**
+- Inventory records: `[ID 3B BE | 00 00 | DATA 2B | 00 00]` = 9 bytes each. Item IDs match the Xbox 360 save editor's IDs (e.g., painkillers `0x001F51`).
+- Multiple snapshots per save (~6 redundant copies of inventory/aug data observed).
+
+### Save-index constraint
+
+The game uses a **save-index** that determines which slots are valid. We **cannot create a new save file** — slot creation must go through the index, and arbitrary new files may be ignored or break indexing. Save-slot replacement / repair must overwrite an existing slot. There is a small GitHub project addressing save-index modifications (link TODO).
+
+Backup files (`*.bak`, `*_Backup`) exist for some slots and can be safely renamed-back.
+
+### Reverse-engineering reference
+
+The Xbox 360 save editor is decompiled in `Deus Ex Editor v3.6/`. Its `form1.cs` contains `ReadSTFS()`, `CacheOffsets()`, `ReadValues()`, and `WriteValues()` — read these to learn item IDs and field offsets the community already RE'd. The Xbox saves are STFS-wrapped; PC saves are not, but the inner `savegame.sav` format is largely the same (see SUMMARY §10).
