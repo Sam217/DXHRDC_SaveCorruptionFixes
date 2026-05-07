@@ -735,12 +735,34 @@ static void __fastcall Hook_LoadFromStream(void *this_, void *edx_,
 	unsigned int total = stream[1];
 	BYTE *dataPtr = (BYTE *)stream[2];
 
+	/* ★ STREAM-EXHAUSTION GUARD ★
+	 *
+	 * The original function reads 1-byte flag + 4-byte count and loops
+	 * `count` times calling RestoreInstance.  If the stream is too
+	 * short to read the count (pos+5 > total), the original DOES NOT
+	 * fail-fast — it leaves the count variable initialized to its
+	 * earlier value `puVar1 = param_1` (the address of the stream
+	 * pointer itself, ~0x02BDxxxx).  The loop then iterates ~45M
+	 * times calling RestoreInstance with garbage descriptor pointers.
+	 *
+	 * Even with Hook 15 catching each fault, 45M SEH unwinds takes
+	 * many minutes.  Fix: detect the exhaustion ourselves and
+	 * early-return without calling original.  This is the same
+	 * outcome the engine would produce if it had a sane "no data →
+	 * no instances" path. */
+	if (pos + 5 > total)
+	{
+		Log("[MEMFIX] LoadFromStream: stream exhausted (pos=%u, total=%u) — "
+				"skipping call (would otherwise loop ~%uM times with garbage idx)\r\n",
+				pos, total, (unsigned)((unsigned)stream / 1000000));
+		return;
+	}
+
 	/* The function reads 1 byte (flag) then 4 bytes (count).
 	 * Peek at the count without advancing the stream. */
 	unsigned int original_count = 0;
 	BOOL capped = FALSE;
 
-	if (pos + 5 <= total)
 	{
 		/* Count is at dataPtr + 1 (after the 1-byte flag) */
 		unsigned int count;
