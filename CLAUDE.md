@@ -6,7 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Windows `version.dll` proxy that hooks the engine of *Deus Ex: Human Revolution — Director's Cut* (DXHRDC.exe, 32-bit) to fix save-load crashes after ~30 hours of gameplay. The shipped engine is a Crystal Dynamics console port with a 512 MB hardcoded dlmalloc pool and many deserialization functions that mishandle corrupted save data. Goal: load corrupted saves, discard the bad fields, keep player progression/inventory.
 
-**The exhaustive context is in [SUMMARY.md](../../../SUMMARY.md)** (in the parent repo root, ~70 KB). Read it before making any non-trivial change — it documents the full hook list (15 active, 1 removed), the allocator architecture, discovered game bugs, the save format reverse-engineering, and the current known state.
+**Three reference files live at the parent repo root:**
+- **[SUMMARY.md](../../../SUMMARY.md)** — chronological narrative of the fix effort, ~80 KB. Read top-to-bottom for context.
+- **[DXHRDC_engine_RE.md](../../../DXHRDC_engine_RE.md)** — function-map / RE knowledge base. Quick reference for "what does FUN_X do?" and "what's at RVA Y?". Use this when investigating a new crash or extending a hook.
+- **[README.md](../../../README.md)** — older user-facing docs.
+
+For non-trivial changes, read SUMMARY first. For "I just need to know about FUN_X" lookups, jump straight to DXHRDC_engine_RE.md.
 
 ### Current state (2026-05-07)
 
