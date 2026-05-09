@@ -1,5 +1,9 @@
 # Deus Ex: Human Revolution Director's Cut — Save Load Fix
 
+> **Companion documents:**
+> - [DXHRDC_engine_RE.md](DXHRDC_engine_RE.md) — RE knowledge base (function map, vtable layouts, crash signature catalog, etc.). **Use this for quick "what is RVA X?" lookups** rather than re-reading SUMMARY.
+> - [CLAUDE.md](.claude/worktrees/bold-shamir-df882c/CLAUDE.md) — quick-start guide for new sessions.
+
 ## A Reverse Engineering Journey
 
 This document chronicles the effort to fix a save-game loading crash in
