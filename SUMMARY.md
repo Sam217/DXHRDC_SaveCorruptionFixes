@@ -1448,8 +1448,294 @@ upstream bug entirely.
 - Reading inventory from the save via dnSpy/Xbox-360 patterns
   (§11.2.4) — PC format is structurally different (40-byte records,
   count at +0x0e, indexed by slot rather than co-located with ID).
-- Reconstructing a working save by transplanting progression onto a
+  **(Note: this referred to the IN-MEMORY layout per CheatEngine; the
+  ON-DISK PC format is a separate, still-undocumented serialization
+  — see §11.9 / §11.10.)**
+- ~~Reconstructing a working save by transplanting progression onto a
   clean modhook-debug-menu donor (Phase B from original plan). Now
   unnecessary because progression is intact in the corrupt saves;
   fixing the loader path (Hook 16 + maybe Hook 5 tightening) lets
-  the existing corrupt saves load without losing data.
+  the existing corrupt saves load without losing data.~~ **Retracted
+  in §11.9: only the ~960 KB progression header survives intact; the
+  inventory/ammo/equipped-weapons on PC live in world state and are
+  partly destroyed by the runaway writer. Phase B (donor + injection)
+  is back on the table.**
+
+---
+
+## 11.7 Phase A1 scanners — falsified (2026-05-13 / 2026-05-14)
+
+The "Phase A1" surgical-patch hypothesis from the original plan died on
+contact with data. Two successive scanner designs were both falsified;
+both are documented here so they don't get re-invented.
+
+### 11.7.1 Stack/heap-range uint32 scanner (`--mode=scan`)
+
+**Hypothesis** (§10.4): corrupted `InstanceTable->field_0x14` values
+all sit in stack address window `0x02000000–0x0FFFFFFF` or heap window
+`0x10000000–0x1FFFFFFF`. A read-only scan over 4-byte-aligned uint32
+LE in the decompressed save buffer should expose:
+- where corruption lives (cluster of hits in world state);
+- when corruption began (chronological progression across saves);
+- which saves are salvageable (low/zero hit count in the progression
+  header).
+
+**Result: hypothesis falsified.** `--mode=scan --scan-all` across 102
+saves shows:
+
+- Every save — including the very first (GAMER26, 2025-11-01) and the
+  known-loadable GAMER51 — has 14,000–29,000 stack-range hits in world
+  state.
+- The progression header has a stable 4,500–5,000 stack-range hits
+  per save, with almost no variance over six months of play.
+- Hit count is uncorrelated with corruption status. Clean GAMER51 has
+  19,762 world-state hits; corrupt GAMER25 has 15,079; corrupt GAMER23
+  has 25,637.
+
+Interpretation: the address windows are not "suspicious values" — they
+are legitimate engine data (item IDs, hash values, encoded floats,
+small denormalized values, etc.) that incidentally falls in those
+numeric ranges. Per the byte-class signature work (§11.7.2), some of
+this data even has a perfectly uniform structure that mimics a
+runaway-writer dump.
+
+**Bonus byproduct: GAMER6_4 stands out.** It's the only save in 102
+with **zero** world-state hits in either window, 1,117 stack-range hits
+in progression header (vs. ~4,700 elsewhere), and zero heap-range hits.
+This confirms GAMER6_4 (created via the modhook debug menu / map
+selector) is a structurally near-empty save — uniquely qualified to
+serve as a clean donor for Phase B grafts.
+
+### 11.7.2 Byte-class anomaly scanner (`--mode=scan-anomalies`)
+
+**Hypothesis**: the runaway-writer signature in the byte-diff analysis
+of §11.2 was a uniform 25.0%/25.0% zero/printable distribution across
+2 KB windows. Slide a 2 KB window across world state, flag windows
+with that signature, merge contiguous flagged windows into regions.
+
+**Result: signature is real, but it ALSO occurs in clean saves at
+~34 KB per save.** Detail:
+
+- GAMER25 (corrupt) flags two regions: one at `0x1ac000–0x1b4800`
+  (~34 KB) AND one at `0x1fb000–0x203800` (~34 KB).
+- GAMER51 (clean) flags one region at exactly `0x1ac000–0x1b4800`
+  — the SAME offsets as GAMER25's first region.
+- Cross-save scan: every save except GAMER6_4 has at least one ~34 KB
+  region. Region offsets move with session state (e.g. saves
+  GAMER71–87 all show their one region at `0x10f000`; saves
+  GAMER21/3/4/7/30 share `0x14dc00`).
+
+Interpretation: a 34 KB block of small-integer engine data (likely
+deferred-light instance arrays per the InstanceTable subsystem of
+§11.4) is **structurally** uniform 25/25 — it's not corruption, it's
+what some engine arrays look like serialized. The ACTUAL corruption in
+GAMER25 is the SECOND region at `0x1fb000`, which GAMER51 lacks.
+
+Region-count alone is not a clean classifier: GAMER50 (crashes) has 2
+regions, GAMER51 (loads) has 1, GAMER53 (crashes) has 1, GAMER23
+(crashes) has 1. A reliable offline detector requires per-area baseline
+comparison, which we have not built.
+
+### 11.7.3 The one part that survived: corrupt-region content in GAMER25
+
+When inspected with raw hex dumps (`evidence_check.py`), the GAMER25
+region starting at `0x1fb000` contains the 4-byte sequence
+`00 63 1f 01` **repeated literally**:
+
+```
+GAMER25 @ 0x1fb000: 00 63 1f 01 00 63 1f 01 00 63 1f 01 00 63 1f 01 ...
+                    (continues for ~34 KB)
+GAMER51 @ 0x1fb000: 00 00 01 cd 27 00 00 b4 0e 00 00 01 ca 27 00 00 ...
+                    (structured 8-byte engine records)
+```
+
+This is unambiguously runaway-writer output. The **exact boundaries**
+of the corruption are NOT pinpointed by byte-diff alone — diff density
+runs 60–86% across a wider band — but the byte-class signature plus
+the literal byte-pattern repetition locate the core of the dump at
+`0x1fb000`. A corollary: the prior "second region at `0x211355`"
+claim in §11.2 is weaker than reported; only one such region is
+clearly identifiable by the scan-anomalies detector. Treat the
+`0x211355` claim as provisional.
+
+
+## 11.8 Inventory is in world state on PC (NOT progression header)
+
+The most consequential finding of the session. Falsifies a load-bearing
+assumption from §11.5/§11.6.
+
+### 11.8.1 Setup
+
+- GAMER51 — clean, painkiller count = 4 (confirmed in-game).
+- GAMER25 — corrupt, painkiller count = 12 (hacked 4 → 12 via
+  CheatEngine just before the save).
+- Both in area `sha_city_port_2a` (§11.10), saved ~30 min apart.
+
+### 11.8.2 Direct byte-diff: progression header
+
+`decode_painkiller_count.py` enumerates all byte differences between
+GAMER51 and GAMER25 in the 0–0xF0000 progression-header region,
+EXCLUDING the corrupted world-state band that we already know about.
+The result:
+
+| offset | length | GAMER51 | GAMER25 | plausible meaning |
+|---|---|---|---|---|
+| `0x0` | 3 | `ac c0 20` | `38 ad 22` | save-file header / outer hash |
+| `0x50c3` | 1 | `01` | `00` | flag |
+| `0x50c8` | 5 | `93 f7 e6 07 39` | `ab cb fb 07 5f` | sequential — looks like FILETIME-encoded save timestamp |
+| `0x50d8` | 2 | `d4 a3` | `d6 a4` | counter or sub-checksum |
+| `0x3eb6a` | 3 | `33 c6 68` | `19 27 ac` | hash |
+
+**FIVE ranges total. No range looks like a payload field; all read as
+timestamps, counters, or hashes.** No offset has GAMER51=4 ∧
+GAMER25=12 in any encoding (u8 / u16 BE/LE / u32 BE/LE).
+
+### 11.8.3 Direct byte-diff: world state
+
+In contrast, the world state (≥0xF0000) — even excluding the known
+corruption regions at `0x1ac000–0x1b4800` and `0x1fb000–0x203800` —
+has **189,945 differing bytes** between GAMER51 and GAMER25,
+collapsed into **2,616 contiguous diff ranges**. The actual inventory
+delta lives somewhere in this haystack.
+
+### 11.8.4 Confirmation via the form1.cs reader (`--mode=read`)
+
+The XP/praxis/inventory reader ported from Deus Ex Editor v3.6
+(form1.cs) was run against GAMER5, GAMER6, GAMER23, GAMER25, GAMER51:
+
+- **`XP_PRAXIS_MAGIC`** (the 12-byte three-item-ID anchor used to
+  locate the four redundant XP/praxis snapshots) — **0 matches in
+  every save.** The Xbox 360 anchor pattern simply does not exist in
+  PC saves.
+- **All 40 catalogued inventory item IDs** (Painkillers, ammos, augs,
+  etc.) — **absent in every save.** The Xbox 360 9-byte
+  `[ID|01|01|count_be|00|00]` and `[ID|01|count_be|00|00]` record
+  formats do not appear on PC.
+
+### 11.8.5 Implication
+
+We have **no working decoder for PC progression / inventory** today.
+Previous notes in `DXHRDC_engine_RE.md` (Subsystem 9 — Inventory PC
+layout) describe the IN-MEMORY layout per CheatEngine — 40-byte
+records, count uint16 at +0x0e — but the on-disk serialization is
+*not* a memory dump of those records. It is a separate, currently
+unmapped engine-side serialization format.
+
+This invalidates several earlier plan branches:
+
+- **Phase B with progression injection** depends on a working
+  inventory decoder. We don't have one.
+- **"Progression is intact" reassurance** (§11.6 wrap-up) only holds
+  for the ~0xF0000 progression header. Inventory, ammo, equipped
+  weapons, and likely other player-state are in world state and at
+  least partly destroyed when the runaway writer hits.
+- **"GAMER5_prog + GAMER6_world graft"** would lose inventory, since
+  inventory lives in the part being replaced.
+
+
+## 11.9 Area name field — fixed at offset `0x503c` (NOT `0x5045`)
+
+Reliable, structural, and trivial to read.
+
+### 11.9.1 Format
+
+Null-terminated ASCII. The string starts at offset `0x503c` (12 bytes
+of preceding zeros), max length observed ~24 characters. Encoded as
+`<chapter_prefix>_<location>`.
+
+The earlier `diff_pair.py` code used `0x5045` (which truncates the
+first 9 bytes — that's why GAMER1 read as just `"r"` and other saves
+read as suffix fragments). The correct offset across all 102 saves is
+`0x503c`. **Always verify by dumping `0x5030..0x5080` framing when in
+doubt** — don't substitute chapter labels for what the bytes actually
+say (lesson learned the hard way this session).
+
+### 11.9.2 Observed area strings
+
+| chapter prefix | location suffixes seen | game chapter (per user playthrough) |
+|---|---|---|
+| `sha_city_` | `port_2a`, `port_2a_int`, `sewer1a`, `lowerharvester` | Hengsha 2 |
+| `sin_` | `omega_exterior` | Singapore — Omega Ranch (exterior) |
+| `dlc_` | `hangar`, `cargo_int` | Missing Link DLC |
+| `pic_` | `helipad` | Picus chapter |
+
+(Chapter mapping above is from the user's playthrough; the file only
+contains the prefix+location.)
+
+### 11.9.3 Donor-area matching across the 102 saves
+
+| target save | area | other saves in same area |
+|---|---|---|
+| GAMER5_4 | `sin_omega_exterior` | **GAMER6_4 (modhook fast-start, world-state-empty), GAMEA1_4** |
+| GAMER23_4 | `dlc_hangar` | GAMER1_4, GAMER20_4, GAMER22_4, GAMER83_4 |
+| GAMER25_4 / GAMER51_4 | `sha_city_port_2a` | GAMER53_4 |
+| GAMER50_4 | `sha_city_lowerharvester` | (only one) |
+| GAMER63_4 | `dlc_cargo_int` | GAMER24_4, GAMEA2_4, GAMEQ1_4 |
+
+**GAMER6_4 matches GAMER5_4's area exactly** and is the only save in
+the corpus with a verifiably scrubbed world state. This makes the
+`GAMER5_prog + GAMER6_world` graft a much stronger experiment than the
+prior `GAMER23 + GAMER63` attempt that failed in §11.1 — IF we are
+willing to accept the inventory loss documented in §11.8.5.
+
+
+## 11.10 Status going into next session
+
+### 11.10.1 What we still want
+
+Salvage GAMER23 / GAMER5 progression so the user does not replay the
+Missing Link / Singapore chapters from scratch.
+
+### 11.10.2 Honest tradeoff matrix
+
+| Approach | Preserves XP/praxis? | Preserves inventory/ammo/augs? | Risk | Effort |
+|---|---|---|---|---|
+| Hook 16 only (preventive) | n/a (no repair) | n/a (no repair) | — | ~60 lines C; user replays current chapter |
+| Surgical zero of just the `0x1fb000` band | Yes (header untouched) | Unknown — may or may not coincide with inventory bytes | Loader may still trip on remaining cross-refs | 30 min Python |
+| `GAMER5_prog + GAMER6_world` hybrid (same area) | Yes | **No** (inventory is in world state, GAMER6 has none) | Low (just an experiment) | 10 min |
+| RE the on-disk PC progression format via Ghidra (writer-side trace) | Yes | Yes (if successful) | Open-ended | multi-session |
+
+### 11.10.3 Recommended sequence (next session)
+
+1. **Surgical-zero experiment first** — fastest, most preserving.
+   Replace bytes `0x1fb000..0x203800` of a corrupt save with zeros (or
+   with GAMER51's bytes at the same offsets, since GAMER51 is in the
+   same area). Write to a backup slot, attempt load. Outcome:
+   - Loads cleanly → ship the tool.
+   - Loads degraded → tells us inventory was in that band.
+   - Crashes → loader has cross-refs we haven't accounted for.
+2. **Hook 16 in parallel** — independent codepath, prevents new
+   corruption regardless of repair outcome.
+3. **`GAMER5_prog + GAMER6_world` graft** — last-resort fallback if
+   user is willing to accept inventory loss.
+
+### 11.10.4 Documentation discipline (lesson learned)
+
+When reporting fields read from binary files, output **only** the
+literal bytes (and raw hex for verification). Do not co-render with
+chapter / level / feature labels unless they are independently
+sourced. The session lost a question/answer cycle to me labeling
+GAMER50 as "Missing Link" and GAMER23 as "sin_qrl_restricted_area"
+when both labels were fabricated. The user knows their own playthrough;
+my job is to read bytes faithfully.
+
+
+## 11.11 Tools added this session
+
+- `pythonSaveRepair/save_repair_tool.py`:
+  - `--mode=scan` (Phase A1 v1) — stack/heap-range uint32 LE hit
+    counter. Falsified. Kept for forensics.
+  - `--mode=scan-anomalies` (Phase A1 v2) — byte-class signature
+    detector (zero in [22,30] AND printable in [22,30]). Detects a
+    real signature but it also fires on legitimate engine data; not a
+    clean classifier by itself.
+  - `--mode=read` — XP/praxis/inventory dump using form1.cs anchor
+    patterns. Confirmed today that the Xbox 360 patterns do not match
+    on PC; returns all-absent for PC saves.
+- `pythonSaveRepair/decode_painkiller_count.py` — one-shot byte-diff
+  between GAMER51 and GAMER25 outside known corrupt regions; output
+  is the 5 progression-header diff ranges of §11.8.2.
+- `pythonSaveRepair/evidence_check.py` — dumps the alleged corruption
+  regions (raw bytes + byte-class) and the area-name field framing.
+  Use it before relying on any prior claim in this document.
+

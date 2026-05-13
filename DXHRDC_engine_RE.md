@@ -420,6 +420,40 @@ header** — suggesting the actual inventory primary storage may sit
 elsewhere (possibly in world-state region, owned by some entity's
 component table, not the progression header).
 
+### Refined 2026-05-14: inventory is in world state on PC
+
+A subsequent byte-diff between GAMER51 (clean, painkiller count = 4)
+and GAMER25 (corrupt twin, count = 12 via CheatEngine hack) using
+`decode_painkiller_count.py` showed:
+
+- The progression header (offset 0 .. 0xF0000) has **only 5 small
+  differing ranges**, all matching timestamp / counter / hash
+  signatures (see SUMMARY §11.8.2 for the table).
+- **No offset has GAMER51 = 4 ∧ GAMER25 = 12** in any encoding
+  (u8 / u16 BE / u16 LE / u32 BE / u32 LE) inside the progression
+  header.
+- Inventory storage must therefore live in world state on PC, **not**
+  in the progression header as the Xbox 360 format assumed.
+- `--mode=read` (which ports form1.cs's anchor patterns) finds the
+  `XP_PRAXIS_MAGIC` 12-byte sequence **zero times** in every sampled
+  PC save, and finds **all 40 catalogued inventory item IDs absent**.
+  The whole Xbox 360 form1.cs decoder does not apply to PC at all.
+
+The 40-byte-record / count-at-`+0x0E` layout described above is the
+**IN-MEMORY** representation (per the CheatEngine read/write sites at
+RVAs `0x003F012A` / `0x0037611A`). The ON-DISK PC serialization is a
+separate format that we have not decoded yet. Re-doing the form1.cs
+work for PC requires either:
+
+1. A CheatEngine snapshot of memory at the moment of save, then a
+   byte-pattern match of the painkiller record against the just-written
+   save file, OR
+2. Ghidra trace of `FUN_003760f0` (or its caller) following the data
+   path into the save-stream writer (likely `cdc::InstanceTable::Save­
+   ToStream` of an inventory-component subclass).
+
+Either is multi-session work.
+
 ---
 
 ## Globals reference
@@ -451,9 +485,12 @@ See SUMMARY §10 for full discussion. Quick form:
 | Encryption | none |
 | Checksum/signature | none |
 | Header `[0..4)` | uint32 LE = "data length" (varies per save; perhaps where engine zero-pads) |
-| Item IDs (3B BE) | DO appear verbatim in PC saves (e.g., painkillers `00 1F 51`) — borrowed from Xbox 360 save editor's catalog |
-| Inventory record framing | ⚠️ **NOT** the Xbox 360 `<ID>01` / `<ID>0101` framing (SUMMARY §11.2.4). PC stores **primary inventory** as a flat 40-byte (`0x28`) record array indexed by **slot**, with count at `slot*0x28 + 0x0E` (uint16). The 3-byte ID is **not co-located** with the count in any single record. See §"Subsystem 9: Inventory" below. |
+| Item IDs (3B BE) | DO appear verbatim in PC saves (e.g., painkillers `00 1F 51`) — borrowed from Xbox 360 save editor's catalog. **These are reference/loot-table entries, not the player inventory storage.** |
+| Inventory record framing | ⚠️ **NOT** the Xbox 360 `<ID>01` / `<ID>0101` framing. Also **not** the in-memory 40-byte-record layout from Subsystem 9 — the on-disk PC serialization has not been decoded. The byte-diff between GAMER51 (count=4) and GAMER25 (count=12) finds the count delta **somewhere in world state** (≥0xF0000), among 189,945 differing bytes across 2,616 ranges. SUMMARY §11.8. |
+| XP / praxis location | **Unknown on PC.** form1.cs's `XP_PRAXIS_MAGIC` anchor (`00 01 2D 75 00 01 2D 83 00 01 2D 7B`) does not exist in any PC save sampled. SUMMARY §11.8.4. |
+| **Area name** | **Null-terminated ASCII at offset `0x503c`** (NOT `0x5045` — that offset, used in earlier code, truncates the prefix). Format `<chapter_prefix>_<location>`, e.g. `sin_omega_exterior`, `dlc_hangar`, `sha_city_port_2a`, `sha_city_lowerharvester`. Reliable across all 102 sampled saves. SUMMARY §11.9. |
 | Redundant snapshots | At least one stride confirmed: `0x2800` (10,240 bytes) between two snapshots of an XP/praxis-or-similar field (SUMMARY §11.2 GAMER51↔53 diff). Total count unverified — earlier "~6 snapshots" claim came from dnSpy and may not apply to PC. |
+| Progression-header diff fingerprint (clean vs corrupt, same area) | Only 5 differing ranges between GAMER51 and GAMER25: `0x0` (3B, file header), `0x50c3` (1B, flag), `0x50c8` (5B, sequential timestamp-ish), `0x50d8` (2B, counter), `0x3eb6a` (3B, hash). All look like metadata, not payload. SUMMARY §11.8.2. |
 
 ### File regions (empirical from GAMER63 vs GAMER23 diff)
 
@@ -513,13 +550,41 @@ When a new crash signature shows up, the playbook is:
   may have been Xbox-specific.
 - ~~InstanceTable struct layout~~ — **Resolved.** 32 bytes; see
   Subsystem 3 above.
-- ~~Inventory format on PC~~ — **Partially resolved.** Primary
-  storage is a 40-byte-record array with count at `slot*0x28 + 0x0E`
-  (uint16). Slot→item-id mapping not yet decoded — would need another
-  CheatEngine trace.
+- ~~Inventory format on PC~~ — **Partially resolved (in-memory only).**
+  IN-MEMORY storage is a 40-byte-record array with count at
+  `slot*0x28 + 0x0E` (uint16). **On-disk serialization is a separate
+  format and remains undecoded.** SUMMARY §11.8.5.
+
+### Re-resolved 2026-05-14 (corrections to prior claims)
+
+- ~~"Progression header is intact in corrupt saves so we just need to
+  fix the loader"~~ — **Retracted.** The ~960 KB progression header
+  *is* mostly intact (only 5 small diff ranges between clean and
+  corrupt same-area pair, all looking like metadata) — but
+  **inventory, ammo, equipped weapons, and likely XP/praxis live in
+  world state on PC**, NOT in the progression header. Loading the
+  corrupt save without losing data therefore requires repairing world
+  state too. SUMMARY §11.8.
+- ~~Phase A1 scanner can identify corrupt regions by uint32-in-stack-
+  range or by byte-class signature~~ — **Both falsified.** Every save
+  has 14-29k stack-range uint32s in world state from legitimate engine
+  data, and the 25/25 byte-class signature appears in every save as a
+  ~34 KB per-area baseline (likely the InstanceTable serialization
+  itself). The detectors find structural data, not corruption.
+  SUMMARY §11.7.
+- ~~Area name at offset `0x5045`~~ — **Wrong; corrected to `0x503c`.**
+  0x5045 truncates the prefix and produces garbage strings like `"r"`
+  (the tail of `dlc_hangar`'s `restricted_area` field) — which led me
+  to fabricate fake chapter labels during a session. Always dump the
+  framing `[0x5030..0x5080]` first.
 
 ### Still open
 
+- **The on-disk PC inventory / XP / praxis layout** (SUMMARY §11.8.5).
+  Needed before any progression-injection or precision-repair tool
+  can be built. Two paths: (a) memory-snapshot at save-time and
+  byte-match against the file, (b) Ghidra trace from `FUN_003760f0`
+  (inventory write site) into the save-stream writer.
 - **The writer-side corruption mechanism (SUMMARY §11.5 Bug A).** What
   during gameplay corrupts the `count` field of a deferred-light
   entity's InstanceTable? Candidates: stack-leak via uninitialized
@@ -528,13 +593,15 @@ When a new crash signature shows up, the playbook is:
   breakpoint on `entity[0x30C] + 0x14` of a live deferred-light
   entity (SUMMARY §11.6 Path C).
 - **Number of corrupted InstanceTables per bad save.** GAMER25 has
-  one 96 KB anomaly and one 24 KB anomaly — could be two entities or
-  one with two write phases. Hook 16's logging would answer this by
-  printing `_ReturnAddress()` for each clamped count.
-- **What lives at file-offset `0x1f8a6f` and `0x211355`** — the two
-  GAMER25-vs-GAMER51 anomalous regions. Which entity's InstanceTable
-  serializes there? This maps the corruption to a specific subsystem
-  (which lights/components).
+  one confirmed ~34 KB corrupt region at `0x1fb000` (the repeated
+  `00 63 1f 01` byte pattern). The earlier "second region at
+  `0x211355`" claim is weak — only one region matches the byte-class
+  scanner's tight 25/25 signature. Hook 16's logging would answer
+  this by printing `_ReturnAddress()` for each clamped count.
+- **What lives at file-offset `0x1fb000`** — the single confidently-
+  corrupt region in GAMER25. Which entity's InstanceTable serializes
+  there? Maps the corruption to a specific subsystem (likely
+  DeferredLightComponent per the vtable share with InstanceTable).
 - Save format **chunk structure** — engine probably parses the
   `0x23A000` buffer as a series of (tag, size, data) chunks but
   boundaries not yet enumerated. Identifying chunk boundaries would
