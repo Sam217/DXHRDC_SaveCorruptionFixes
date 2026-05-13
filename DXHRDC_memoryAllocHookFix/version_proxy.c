@@ -72,6 +72,7 @@
 #include <string.h>
 #include <tlhelp32.h>
 #include <windows.h>
+#include <intrin.h> /* _ReturnAddress() — Hook 13 caller-site detection */
 
 /* ================================================================
  * 1. VERSION.DLL FORWARDING
@@ -734,12 +735,34 @@ static void __fastcall Hook_LoadFromStream(void *this_, void *edx_,
 	unsigned int total = stream[1];
 	BYTE *dataPtr = (BYTE *)stream[2];
 
+	/* ★ STREAM-EXHAUSTION GUARD ★
+	 *
+	 * The original function reads 1-byte flag + 4-byte count and loops
+	 * `count` times calling RestoreInstance.  If the stream is too
+	 * short to read the count (pos+5 > total), the original DOES NOT
+	 * fail-fast — it leaves the count variable initialized to its
+	 * earlier value `puVar1 = param_1` (the address of the stream
+	 * pointer itself, ~0x02BDxxxx).  The loop then iterates ~45M
+	 * times calling RestoreInstance with garbage descriptor pointers.
+	 *
+	 * Even with Hook 15 catching each fault, 45M SEH unwinds takes
+	 * many minutes.  Fix: detect the exhaustion ourselves and
+	 * early-return without calling original.  This is the same
+	 * outcome the engine would produce if it had a sane "no data →
+	 * no instances" path. */
+	if (pos + 5 > total)
+	{
+		Log("[MEMFIX] LoadFromStream: stream exhausted (pos=%u, total=%u) — "
+				"skipping call (would otherwise loop ~%uM times with garbage idx)\r\n",
+				pos, total, (unsigned)((unsigned)stream / 1000000));
+		return;
+	}
+
 	/* The function reads 1 byte (flag) then 4 bytes (count).
 	 * Peek at the count without advancing the stream. */
 	unsigned int original_count = 0;
 	BOOL capped = FALSE;
 
-	if (pos + 5 <= total)
 	{
 		/* Count is at dataPtr + 1 (after the 1-byte flag) */
 		unsigned int count;
@@ -1112,12 +1135,14 @@ static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
 	/* Validate the returned pointer.
 	 * A valid string pointer should be:
 	 * - Non-null
-	 * - In a reasonable memory range (above 0x10000, below 0x7FFE0000)
+	 * - Above 0x10000 (NULL page is reserved on Windows)
+	 * - Below 0xFFFEFFFF (kernel reserves top page;
+	 *     DXHRDC.exe is /LARGEADDRESSAWARE so user-mode reaches ~4 GB)
 	 * - Readable (at least the first byte)
 	 * Invalid pointers like 0x00001005 will be caught here. */
 	if (result == NULL ||
 			(DWORD)(DWORD_PTR)result < 0x10000 ||
-			(DWORD)(DWORD_PTR)result > 0x7FFE0000 ||
+			(DWORD)(DWORD_PTR)result > 0xFFFEFFFF ||
 			IsBadReadPtr(result, 1))
 	{
 		/* Return a safe string instead of the garbage pointer */
@@ -1128,73 +1153,481 @@ static char *__cdecl Hook_GetHeapCategoryName(int categoryId)
 }
 
 /* ================================================================
- * 9g. HOOK 10 — Direct dlmalloc wrapper (Path B fallback)
+ * 9h. HOOK 11 — BuildDrmFilename (filename pointer sanitization)
  *
- * RVA 0x001fe4e0   __thiscall   int (int size, undefined4 extra)
+ * RVA 0x000a4240   __cdecl   void (char* outBuf, void* filename)
  *
- * This function calls cdc::dlmalloc DIRECTLY, bypassing our hooked
- * MemHeapAllocator::Allocate.  When dlmalloc fails, it returns NULL
- * to the caller, which then tries to log the error using a different
- * error path (not GamePrintError), crashing on corrupted args.
+ * This is a tiny one-liner wrapper:
+ *   _sprintf(outBuf, "%s%s.drm", &prefix, filename);
  *
- * Our hook adds VirtualAlloc fallback — same strategy as Hook 2.
+ * It is reached during level-load instance restoration via:
+ *   FUN_0022ff60 (level loader)
+ *     → FUN_000ede40(idx)  [thin wrapper, idx = resource ID]
+ *       → LoadDrmResourceById (FUN_000edcc0)
+ *         → BuildDrmFilename(buf, table[idx*8])
  *
- * Prologue (5 bytes stolen):
- *   001fe4e0  53               PUSH EBX
- *   001fe4e1  56               PUSH ESI
- *   001fe4e2  8B F1            MOV ESI, ECX  (partially — 3rd byte)
+ * BUG (in both DC and original release — verified in dxhr.exe):
+ * LoadDrmResourceById has a broken bounds check that calls a handler
+ * but does NOT prevent the subsequent OOB read of table[idx*8] when
+ * idx is corrupted.  The OOB read produces a garbage "filename"
+ * pointer (e.g. 0x00001005) which is then passed to _sprintf, whose
+ * %s walker faults dereferencing it.  This is the actual crash at
+ * RVA 0x00641FDE in __output_l reading 0x1005.
  *
- * Actually we need 6 bytes for two complete instructions:
- *   001fe4e0  53               PUSH EBX       (1 byte)
- *   001fe4e1  56               PUSH ESI       (1 byte)
- *   001fe4e2  8B F1            MOV ESI, ECX   (2 bytes)
- *   001fe4e4  57               PUSH EDI       (1 byte)
- *   → 5 bytes = PUSH EBX + PUSH ESI + MOV ESI,ECX + PUSH EDI
- *     but JMP rel32 needs 5 bytes, and PUSH EBX(1)+PUSH ESI(1)+MOV ESI,ECX(2)=4
- *     We need at least 5: steal PUSH EBX+PUSH ESI+MOV ESI,ECX+PUSH EDI = 5 bytes
+ * Our hook validates the filename pointer BEFORE _sprintf would
+ * walk it.  If invalid, write an empty string into the output buffer
+ * and return.  The caller (LoadDrmResourceById) then passes that
+ * empty path to FUN_001a7590, which fails to load the resource and
+ * leaves the cache slot at 0 — a recoverable state.
  *
- * Returns int (pointer).  RET 0x8 (callee cleans 2 stack args).
+ * Prologue (8 bytes stolen — two complete instructions):
+ *   000a4240  8B 44 24 08    MOV EAX, [ESP+8]   ; param_2 (filename)
+ *   000a4244  8B 4C 24 04    MOV ECX, [ESP+4]   ; param_1 (outBuf)
+ *
+ * __cdecl, returns void, RET (no callee cleanup).
  * ================================================================ */
 
-#define RVA_DIRECTMALLOC 0x001fe4e0
-#define STEAL_DIRECTMALLOC 5
+#define RVA_BUILDDRM 0x000a4240
+#define STEAL_BUILDDRM 8
 
-static HookCtx g_hkDirectMalloc;
+static HookCtx g_hkBuildDrm;
+static volatile LONG g_buildDrmRejects = 0;
 
-typedef int(__fastcall *OrigDirectMalloc_t)(void *, void *, int, int);
+typedef void(__cdecl *OrigBuildDrm_t)(char *, void *);
 
-static int __fastcall Hook_DirectMalloc(void *this_, void *edx_,
-																				int size, int extra)
+static void __cdecl Hook_BuildDrmFilename(char *outBuf, void *filename)
 {
-	OrigDirectMalloc_t orig = (OrigDirectMalloc_t)(g_hkDirectMalloc.trampoline);
-	int result = orig(this_, edx_, size, extra);
-
-	if (result == 0 && size > 0)
+	/* Validate filename pointer.
+	 * A valid string pointer should be in user-mode address space
+	 * and point to readable memory.  Garbage values from OOB reads
+	 * (e.g. 0x00001005) get rejected here before _sprintf walks them.
+	 *
+	 * NOTE: DXHRDC.exe is /LARGEADDRESSAWARE so on 64-bit Windows the
+	 * user-mode range goes up to ~0xFFFEFFFF (almost 4 GB), not the
+	 * standard 2 GB.  The earlier 0x7FFE0000 bound was rejecting valid
+	 * high-heap pointers (e.g. 0x81C5D5B5 observed at startup). */
+	if (filename == NULL ||
+			(DWORD)(DWORD_PTR)filename < 0x10000 ||
+			(DWORD)(DWORD_PTR)filename > 0xFFFEFFFF ||
+			IsBadReadPtr(filename, 1))
 	{
-		/* Reject insane sizes */
-		if (size < 0 || (MAX_SANE_ALLOC_SIZE > 0 &&
-										 (unsigned)size > MAX_SANE_ALLOC_SIZE))
+		LONG n = InterlockedIncrement(&g_buildDrmRejects);
+		if (n <= 20)
 		{
-			Log("[MEMFIX] DirectMalloc: REJECTED insane size %d\r\n", size);
-			return 0;
+			/* Throttle log spam — first 20 rejections only */
+			Log("[MEMFIX] BuildDrmFilename: REJECTED bad filename ptr 0x%08X "
+					"(rejection #%ld)\r\n",
+					(unsigned)(DWORD_PTR)filename, n);
+		}
+		if (outBuf)
+			outBuf[0] = 0; /* empty string — caller will fail-load gracefully */
+		return;
+	}
+
+	OrigBuildDrm_t orig = (OrigBuildDrm_t)(g_hkBuildDrm.trampoline);
+	orig(outBuf, filename);
+}
+
+/* ================================================================
+ * 9i. HOOK 12 — LoadDrmResourceById (index validation at the source)
+ *
+ * RVA 0x000edcc0   __cdecl   void (int idx, int param_2)
+ *
+ * This is the function whose broken bounds check produces the bad
+ * filename pointer Hook 11 catches.  The original logic:
+ *
+ *   if (count < idx) FUN_000ed8f0();  // tries to reload+grow table
+ *   ECX = table[idx*8];               // OOB read if idx still > count
+ *   BuildDrmFilename(buf, ECX);       // garbage filename
+ *   FUN_001a7590(buf, ...);           // resource loader
+ *   *cache_slot = result;
+ *
+ * The bounds-check handler doesn't actually prevent the OOB read.
+ * Even after FUN_000ed8f0 reloads from objectlist.txt, the new count
+ * may still be < idx for a corrupted save, and the read proceeds
+ * regardless.
+ *
+ * Hook 12 validates BOTH the idx range and the entry value at
+ * table[idx*8] BEFORE any of the function's logic runs.  Two reasons
+ * to reject:
+ *   1. idx > max_id  → OOB read would happen
+ *   2. table[idx*8] is not a plausible string pointer (NULL,
+ *      < 0x10000, > 0xFFFEFFFF, or IsBadReadPtr) → entry was
+ *      never populated or was corrupted; the original would call
+ *      BuildDrmFilename with garbage, leading to the downstream
+ *      assert-via-GamePrintError NULL deref.
+ *
+ * If we reject, no cache slot is allocated, BuildDrmFilename and
+ * FUN_001a7590 are never called.
+ *
+ * Table layout (from FUN_000ed8f0 reverse-engineering):
+ *   [+0x00] max_id (1-based; not entry count)
+ *   [+0x04] data buffer pointer
+ *   [+0x08 + (idx-1)*8 + 0] entry[idx-1].filename_ptr  (so [base + idx*8])
+ *   [+0x08 + (idx-1)*8 + 4] entry[idx-1].id            (so [base + idx*8 + 4])
+ *
+ * IDs in [1, max_id] may not all be populated — unpopulated slots
+ * keep the init values 0x00000000 (filename_ptr) and 0xFFFFFFFF (id).
+ * That's why the idx range check alone is insufficient.
+ *
+ * Global indirection mirrors the original code:
+ *   table_ptr = *(int **)(base + 0x00a9a43c);  // first deref
+ *   tableBase = *(int **)((char *)table_ptr + 0x18);  // second deref
+ *   max_id    = tableBase[0];
+ *   filename  = tableBase[idx*2]  // i.e. *(void **)(tableBase + idx*8)
+ *
+ * Prologue (6 bytes stolen — exactly one instruction):
+ *   000edcc0  81 EC 04 01 00 00    SUB ESP, 0x104
+ *
+ * __cdecl, returns void, takes 2 stack args.  RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_LOADDRM 0x000edcc0
+#define STEAL_LOADDRM 6
+#define RVA_DAT_GLOBAL_TABLE_PP 0x00a9a43c
+
+static HookCtx g_hkLoadDrm;
+static volatile LONG g_loadDrmRejects = 0;
+
+typedef void(__cdecl *OrigLoadDrm_t)(int idx, int param_2);
+
+/* Reasons we may reject a LoadDrmResourceById call. */
+typedef enum
+{
+	REJECT_NONE = 0,
+	REJECT_OOB_IDX,			 /* idx > max_id */
+	REJECT_BAD_FILENAME, /* table[idx*8] is not a plausible string ptr */
+} LoadDrmReject;
+
+/* Inspect the resource table to decide whether this call should run.
+ * Returns REJECT_NONE if the call should proceed, or a specific reason
+ * if it should be skipped.  Out-params return the diagnostic values
+ * for logging.  Wrapped in __try/__except because globals may be
+ * unmapped or torn-down at process exit. */
+static LoadDrmReject InspectTableEntry(BYTE *base, int idx,
+																			 int *outCount, void **outFilenamePtr)
+{
+	*outCount = -1;
+	*outFilenamePtr = NULL;
+
+	__try
+	{
+		int *tableStruct = *(int **)(base + RVA_DAT_GLOBAL_TABLE_PP);
+		if (tableStruct == NULL)
+			return REJECT_NONE; /* table not initialized yet → defer to orig */
+
+		int *tableBase = *(int **)((char *)tableStruct + 0x18);
+		if (tableBase == NULL)
+			return REJECT_NONE; /* table not initialized yet → defer to orig */
+
+		int count = tableBase[0];
+		*outCount = count;
+
+		if (idx > count)
+			return REJECT_OOB_IDX;
+
+		/* Replicate the original's read so we can inspect the value
+		 * before the function uses it: ECX = table[idx*8].
+		 * Note: 'count' is actually max_id (1-based); entries are stored
+		 * at offset idx*8 directly (so [tableBase + idx*8] for valid
+		 * 1-based idx). */
+		void *filenamePtr = *(void **)((char *)tableBase + idx * 8);
+		*outFilenamePtr = filenamePtr;
+
+		if (filenamePtr == NULL ||
+				(DWORD)(DWORD_PTR)filenamePtr < 0x10000 ||
+				(DWORD)(DWORD_PTR)filenamePtr > 0xFFFEFFFF ||
+				IsBadReadPtr(filenamePtr, 1))
+		{
+			return REJECT_BAD_FILENAME;
 		}
 
-		void *fb = VirtualAlloc(NULL, (SIZE_T)(unsigned int)size,
-														MEM_COMMIT | MEM_RESERVE,
-														PAGE_READWRITE);
-		if (fb)
+		return REJECT_NONE;
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		/* Any read fault during inspection → defer to orig and let
+		 * Hook 11 catch the bad pointer downstream. */
+		return REJECT_NONE;
+	}
+}
+
+static void __cdecl Hook_LoadDrmResourceById(int idx, int param_2)
+{
+	BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+	int count = -1;
+	void *filenamePtr = NULL;
+	LoadDrmReject reason = InspectTableEntry(base, idx, &count, &filenamePtr);
+
+	if (reason != REJECT_NONE)
+	{
+		LONG n = InterlockedIncrement(&g_loadDrmRejects);
+		if (n <= 20)
 		{
-			TrackAdd(fb, (SIZE_T)(unsigned int)size);
-			result = (int)(DWORD_PTR)fb;
-			Log("[MEMFIX] FALLBACK: DirectMalloc(%u) -> 0x%08X\r\n",
-					(unsigned)size, result);
-		} else
+			const char *why = (reason == REJECT_OOB_IDX)			? "OOB idx"
+												: (reason == REJECT_BAD_FILENAME) ? "bad filename ptr"
+																													: "?";
+			Log("[MEMFIX] LoadDrmResourceById: REJECTED %s — idx=%d "
+					"max_id=%d filename_ptr=0x%08X (rejection #%ld)\r\n",
+					why, idx, count, (unsigned)(DWORD_PTR)filenamePtr, n);
+		}
+		return; /* skip the entire function — no cache slot, no load */
+	}
+
+	OrigLoadDrm_t orig = (OrigLoadDrm_t)(g_hkLoadDrm.trampoline);
+	orig(idx, param_2);
+}
+
+/* ================================================================
+ * 9j. HOOK 13 — FUN_001a4c80 (caller-aware safe stub)
+ *
+ * RVA 0x001a4c80   __cdecl   int (uint id)
+ *
+ * FUN_001a4c80 is a tiny global-table lookup:
+ *   if (id < 0x18000 && DAT_015806e8[id] != NULL && entry->flag == 0)
+ *     return entry + 0x10;
+ *   return 0;
+ *
+ * 100+ callers throughout the engine.  Most check the NULL return
+ * cleanly and skip the missing entry.  An entire family of save
+ * deserializers at RVA 0x25Bxxx..0x25Exxx all share the engine's
+ * classic check-then-deref-anyway (or no-check-at-all) bug.
+ * Confirmed instances:
+ *
+ *   FUN_0025cb50:                              FUN_0025e090 (excerpt):
+ *     piVar3 = FUN_001a4c80(param_1);            puVar8 = FUN_001a4c80(uVar12);
+ *     if (piVar3[6] != 0) { ... }                if (puVar8 != NULL) {
+ *     ↑ piVar3[6] = NULL+0x18 → CRASH                uVar9 = *puVar8;  // safe
+ *                                                    if (uVar9 != 0) ...
+ *                                                    if (uVar9 <= uVar10) goto SKIP;
+ *                                                }
+ *                                                // ★ falls through with puVar8 NULL
+ *                                                if (*(... + puVar8[1]) != 0) {
+ *                                                ↑ puVar8[1] = NULL+0x04 → CRASH
+ *
+ * Other callers in the family (FUN_0025bb50, _25c580, _25dcc0,
+ * _25de90, _25df50, _25e010, _25e390) almost certainly have the
+ * same shape.  When the corrupted save references unknown ids,
+ * any of them can crash.
+ *
+ * We can't change FUN_001a4c80's NULL semantic globally (would
+ * break the 90+ legitimate "is this entry present?" callers
+ * outside the deserializer family).  Instead, the hook checks
+ * the return address: if the call originated from inside the
+ * deserializer family RA range AND the lookup missed, return a
+ * pointer to a static 16-uint zero stub.  With all-zero values:
+ *
+ *   - FUN_0025cb50: piVar3[6]==0 → skip the loop body → return
+ *   - FUN_0025e090: *puVar8==0, puVar8[1]==0... but the buggy
+ *     deref is taken via OR-shortcircuit (0<=0) goto SKIP first
+ *
+ * The stub is sized at 16 uints (64 bytes) to absorb common
+ * piVar3[N] access patterns for small N without OOB.
+ *
+ * Prologue (9 bytes stolen — two complete instructions):
+ *   001a4c80  8B 44 24 04          MOV EAX, [ESP+4]        (4 bytes)
+ *   001a4c84  3D 00 80 01 00       CMP EAX, 0x18000        (5 bytes)
+ *
+ * __cdecl, returns int, takes 1 stack arg.  RET (no callee cleanup).
+ * ================================================================ */
+
+#define RVA_LOOKUP 0x001a4c80
+#define STEAL_LOOKUP 9
+
+/* The save-deserializer family at RVA 0x25Bxxx..0x25Exxx all call
+ * FUN_001a4c80 to look up game-object data by id and all share the
+ * same engine bug — they dereference the result with no NULL guard
+ * (or only a partial guard).  Confirmed at least:
+ *   FUN_0025cb50  →  piVar3[6]    (NULL + 0x18 → crash)
+ *   FUN_0025e090  →  puVar8[1]    (NULL + 0x04 → crash)
+ * Other callers in the family (FUN_0025bb50, _25c580, _25dcc0,
+ * _25de90, _25df50, _25e010, _25e390) almost certainly have the
+ * same shape.  Cheaper to substitute the stub for the whole family
+ * than to chase each function individually. */
+#define RVA_DESERIALIZER_FAMILY_START 0x0025b000
+#define RVA_DESERIALIZER_FAMILY_END 0x00260000 /* exclusive */
+
+static HookCtx g_hkLookup;
+static volatile LONG g_lookupStubs = 0;
+
+/* Static stub returned to deserializer-family callers on lookup miss.
+ * Sized at 16 uints (64 bytes) so common access patterns like
+ * piVar3[N] for small N read zero instead of OOB.  Confirmed safe
+ * uses so far: stub[0] (count), stub[1] (ptr to inner array — only
+ * read when count > 0, which is false for our stub), stub[6] (count
+ * in FUN_0025cb50).  Padding to 16 covers other plausible offsets
+ * we haven't seen yet. */
+static unsigned int g_lookupStub[16] = {0};
+
+typedef int(__cdecl *OrigLookup_t)(unsigned int id);
+
+static int __cdecl Hook_FUN_001a4c80(unsigned int id)
+{
+	OrigLookup_t orig = (OrigLookup_t)(g_hkLookup.trampoline);
+	int result = orig(id);
+
+	if (result == 0)
+	{
+		/* MSVC intrinsic — return address of the call into our hook. */
+		DWORD ra = (DWORD)(DWORD_PTR)_ReturnAddress();
+		BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+		DWORD famStart = (DWORD)(DWORD_PTR)(base + RVA_DESERIALIZER_FAMILY_START);
+		DWORD famEnd = (DWORD)(DWORD_PTR)(base + RVA_DESERIALIZER_FAMILY_END);
+
+		if (ra >= famStart && ra < famEnd)
 		{
-			Log("[MEMFIX] FALLBACK FAILED: DirectMalloc(%u) err=%u\r\n",
-					(unsigned)size, GetLastError());
+			LONG n = InterlockedIncrement(&g_lookupStubs);
+			if (n <= 20)
+			{
+				Log("[MEMFIX] FUN_001a4c80: substituted safe stub for "
+						"deserializer call (id=%u, RA=0x%08X = RVA 0x%08X, "
+						"substitution #%ld)\r\n",
+						id, (unsigned)ra, (unsigned)(ra - (DWORD)(DWORD_PTR)base), n);
+			}
+			return (int)(DWORD_PTR)g_lookupStub;
 		}
 	}
+
 	return result;
+}
+
+/* ================================================================
+ * 9k. HOOK 14 — FUN_00065180 (SEH wrapper around vtable-deref crash)
+ *
+ * RVA 0x00065180   __thiscall   void (uint *stream)
+ *
+ * After the deserializer family at 0x25Bxxx-0x25Exxx (Hook 13's
+ * scope) finishes, the corrupted save advances into the next layer:
+ * an instance/object initializer that reads an index from the stream,
+ * looks up an object pointer in a table, and tail-calls a vtable
+ * function on it — with NO NULL guard:
+ *
+ *   FUN_00065180:
+ *     orig_FUN_00065020(this);              // state init
+ *     puVar2 = stream_read_u32(stream);     // index
+ *     this->field_0x154 = stream_read_u32(stream);
+ *     if ((int)puVar2 < 0) return;          // only filters signed-negative
+ *     piVar1 = *(int **)(this->table_at_0x18 + puVar2*4);
+ *     this->field_0x28  = piVar1;
+ *     this->field_0x15c = piVar1;
+ *     // ★ TAIL CALL: piVar1->vtable[+0x58](piVar1, stream)
+ *     //   crashes at MOV EDX,[ECX] when piVar1 is NULL — table entry
+ *     //   for the corrupted index is 0, no NULL check
+ *
+ * Crash registers: ECX=0 (NULL piVar1), reading [NULL+0] for vtable.
+ *
+ * Fix: __try/__except wrap the trampoline call.  The before-crash
+ * side effects (this->field_0x28 = NULL, this->field_0x15c = NULL)
+ * are actually beneficial — downstream code that reads those fields
+ * will see NULL and (hopefully) skip cleanly.  If a follow-up crash
+ * surfaces because some downstream code doesn't NULL-check those
+ * fields either, we patch that next.
+ *
+ * Tail-call analysis (vfunc returns directly to OUR hook's caller):
+ * The vfunc's RET 0x4 cleans the stream slot we pushed for orig.
+ * Our hook's epilogue RET 0x4 cleans the stream the caller pushed
+ * for us.  Both balanced; SEH unwinds cleanly to our handler.
+ *
+ * Prologue (5 bytes stolen — exactly four instructions):
+ *   00065180  53           PUSH EBX        (1 byte)
+ *   00065181  56           PUSH ESI        (1 byte)
+ *   00065182  57           PUSH EDI        (1 byte)
+ *   00065183  8B F1        MOV ESI, ECX    (2 bytes)
+ *
+ * __thiscall (this in ECX), 1 stack arg (stream), RET 0x4.
+ * Captured as __fastcall(this, edx_unused, stream).
+ * ================================================================ */
+
+#define RVA_FUN_65180 0x00065180
+#define STEAL_FUN_65180 5
+
+static HookCtx g_hkFun65180;
+static volatile LONG g_fun65180Catches = 0;
+
+typedef void(__fastcall *OrigFun65180_t)(void *this_, void *edx_,
+																				 unsigned int *stream);
+
+static void __fastcall Hook_FUN_00065180(void *this_, void *edx_,
+																				 unsigned int *stream)
+{
+	OrigFun65180_t orig = (OrigFun65180_t)(g_hkFun65180.trampoline);
+	__try
+	{
+		orig(this_, edx_, stream);
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LONG n = InterlockedIncrement(&g_fun65180Catches);
+		if (n <= 20)
+		{
+			Log("[MEMFIX] FUN_00065180: caught vtable NULL deref "
+					"(catch #%ld) — corrupt save object idx in stream\r\n",
+					n);
+		}
+		/* Function leaves this->field_0x28 = NULL, this->field_0x15c = NULL.
+		 * Downstream code should treat those as "no object" and skip. */
+	}
+}
+
+/* ================================================================
+ * 9l. HOOK 15 — cdc::InstanceTable::RestoreInstance (SEH wrap)
+ *
+ * RVA 0x000ecc80   __thiscall   int (InstanceDescriptor *desc)
+ *
+ * Already named in Ghidra by the user as critical.  This is THE
+ * function that restores one instance from save data.  Reads various
+ * fields off the descriptor (param_1) at offsets 0x11c, 0x120, 0x128,
+ * 0x12c, etc.  When the descriptor pointer is corrupted (valid-looking
+ * but pointing at a too-small or unmapped region), the field reads
+ * fault.
+ *
+ * Observed crash: MOVZX EAX, word ptr [EBX + 0x11c] at RVA 0x000ECCFD
+ * with EBX = 0x7F070950 (a corrupted descriptor).  Reading offset 0x11c
+ * = 0x7F070A6C → access violation.
+ *
+ * The function ALREADY has multiple "return 0" early-exit paths for
+ * various validation failures, and the caller of RestoreInstance
+ * checks the return value.  So returning 0 on a fault is the SAME
+ * outcome the function already produces for known-bad inputs — the
+ * caller skips this instance and continues with the next.
+ *
+ * Lose ONE bad instance per fault, not the whole load — exactly the
+ * "discard corrupt data, keep valid" goal from the project brief.
+ *
+ * Prologue (6 bytes stolen — three complete instructions):
+ *   000ecc80  55           PUSH EBP                (1 byte)
+ *   000ecc81  8B EC        MOV EBP, ESP            (2 bytes)
+ *   000ecc83  83 E4 F0    AND ESP, 0xFFFFFFF0      (3 bytes)
+ *
+ * __thiscall (this in ECX), 1 stack arg (descriptor), RET 0x4.
+ * Captured as __fastcall(this, edx_unused, descriptor).
+ * ================================================================ */
+
+#define RVA_RESTORE_INSTANCE 0x000ecc80
+#define STEAL_RESTORE_INSTANCE 6
+
+static HookCtx g_hkRestoreInst;
+static volatile LONG g_restoreInstCatches = 0;
+
+typedef int(__fastcall *OrigRestoreInst_t)(void *this_, void *edx_,
+																					 void *descriptor);
+
+static int __fastcall Hook_RestoreInstance(void *this_, void *edx_,
+																					 void *descriptor)
+{
+	OrigRestoreInst_t orig = (OrigRestoreInst_t)(g_hkRestoreInst.trampoline);
+	__try
+	{
+		return orig(this_, edx_, descriptor);
+	} __except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LONG n = InterlockedIncrement(&g_restoreInstCatches);
+		if (n <= 20)
+		{
+			Log("[MEMFIX] RestoreInstance: caught fault for descriptor 0x%08X "
+					"(catch #%ld) — corrupt instance descriptor, instance skipped\r\n",
+					(unsigned)(DWORD_PTR)descriptor, n);
+		}
+		return 0; /* same outcome as the function's existing early-exit paths */
+	}
 }
 
 /* ================================================================
@@ -1223,7 +1656,9 @@ static void LogBytes(const char *label, BYTE *addr, int n)
  * normal crash dialog still appears.  We just add logging.
  * ================================================================ */
 
-static volatile LONG g_exceptionLogged = 0; /* log only once */
+static volatile LONG g_exceptionLoggedCount = 0;
+static volatile DWORD g_lastLoggedExAddr = 0;
+#define VEH_MAX_EXCEPTIONS_LOGGED 5
 
 static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 {
@@ -1238,12 +1673,27 @@ static LONG NTAPI Veh_CrashLogger(PEXCEPTION_POINTERS info)
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
-	/* Log only the first exception — prevents infinite spam when
-	 * the exception re-fires because no handler resolved it. */
-	if (InterlockedCompareExchange(&g_exceptionLogged, 1, 0) != 0)
+	/* Log up to VEH_MAX_EXCEPTIONS_LOGGED distinct exceptions.
+	 *
+	 * If the SAME EIP is faulting repeatedly (the exception re-fires
+	 * because no SEH handler caught it and the OS keeps invoking VEH),
+	 * suppress to avoid infinite log spam — the first log already
+	 * captured everything useful about that EIP.
+	 *
+	 * If a NEW EIP is faulting (likely an SEH-caught earlier exception
+	 * led to a follow-up crash elsewhere), let it through and log it
+	 * up to the cap. */
+	DWORD exAddrNow = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
+	if (exAddrNow == g_lastLoggedExAddr)
 	{
-		return EXCEPTION_CONTINUE_SEARCH;
+		return EXCEPTION_CONTINUE_SEARCH; /* same EIP — already logged */
 	}
+	if (g_exceptionLoggedCount >= VEH_MAX_EXCEPTIONS_LOGGED)
+	{
+		return EXCEPTION_CONTINUE_SEARCH; /* hit cap */
+	}
+	InterlockedIncrement(&g_exceptionLoggedCount);
+	g_lastLoggedExAddr = exAddrNow;
 
 	BYTE *base = (BYTE *)GetModuleHandleA(NULL);
 	DWORD exAddr = (DWORD)(DWORD_PTR)info->ExceptionRecord->ExceptionAddress;
@@ -1561,29 +2011,154 @@ static BOOL InstallAllHooks(void)
 		}
 	}
 
-	/* Hook 10: Direct dlmalloc wrapper (FUN_001fe4e0) — Path B fallback.
-	 * This function calls dlmalloc directly, bypassing our hooked Allocate.
-	 * Without this hook, failed allocations on Path B return NULL and the
-	 * caller crashes.  We add the same VirtualAlloc fallback as Hook 2. */
-	BYTE *pDirect = base + RVA_DIRECTMALLOC;
-	LogBytes("DirectMalloc   ", pDirect, 16);
+	/* Hook 11: BuildDrmFilename — sanitize filename pointer before _sprintf.
+	 * The actual crash at RVA 0x00641FDE (in statically-linked __output_l)
+	 * comes from this wrapper being called with a corrupted filename pointer
+	 * (e.g. 0x00001005) due to an OOB read in LoadDrmResourceById.  This
+	 * hook validates the pointer and substitutes an empty string when bad. */
+	BYTE *pBuildDrm = base + RVA_BUILDDRM;
+	LogBytes("BuildDrmFilen  ", pBuildDrm, 16);
 
-	if (pDirect[0] != 0x53 || pDirect[1] != 0x56 ||
-			pDirect[2] != 0x8B || pDirect[3] != 0xF1)
+	if (pBuildDrm[0] != 0x8B || pBuildDrm[1] != 0x44 ||
+			pBuildDrm[2] != 0x24 || pBuildDrm[3] != 0x08)
 	{
-		Log("[MEMFIX] WARNING: DirectMalloc prologue mismatch! "
-				"Expected 53 56 8B F1, got %02X %02X %02X %02X\r\n",
-				pDirect[0], pDirect[1], pDirect[2], pDirect[3]);
-		Log("[MEMFIX]   Hook 10 SKIPPED\r\n");
+		Log("[MEMFIX] WARNING: BuildDrmFilename prologue mismatch! "
+				"Expected 8B 44 24 08, got %02X %02X %02X %02X\r\n",
+				pBuildDrm[0], pBuildDrm[1], pBuildDrm[2], pBuildDrm[3]);
+		Log("[MEMFIX]   Hook 11 SKIPPED\r\n");
 	} else
 	{
-		if (!InstallHook(&g_hkDirectMalloc, pDirect,
-										 (void *)Hook_DirectMalloc, STEAL_DIRECTMALLOC))
+		if (!InstallHook(&g_hkBuildDrm, pBuildDrm,
+										 (void *)Hook_BuildDrmFilename, STEAL_BUILDDRM))
 		{
-			Log("[MEMFIX] FAILED to hook DirectMalloc\r\n");
+			Log("[MEMFIX] FAILED to hook BuildDrmFilename\r\n");
 		} else
 		{
-			Log("[MEMFIX] [OK] Hooked DirectMalloc (Path B fallback)\r\n");
+			Log("[MEMFIX] [OK] Hooked BuildDrmFilename (filename ptr sanitization)\r\n");
+		}
+	}
+
+	/* Hook 12: LoadDrmResourceById — validate resource index at the source.
+	 * The engine's bounds check is broken (it tries to grow the table but
+	 * still reads OOB if the new count is still < idx).  This hook checks
+	 * idx against the current table count and skips the entire function
+	 * when idx is OOB, preventing the bad filename pointer from being
+	 * constructed in the first place. */
+	BYTE *pLoadDrm = base + RVA_LOADDRM;
+	LogBytes("LoadDrmResId   ", pLoadDrm, 16);
+
+	if (pLoadDrm[0] != 0x81 || pLoadDrm[1] != 0xEC ||
+			pLoadDrm[2] != 0x04 || pLoadDrm[3] != 0x01 ||
+			pLoadDrm[4] != 0x00 || pLoadDrm[5] != 0x00)
+	{
+		Log("[MEMFIX] WARNING: LoadDrmResourceById prologue mismatch! "
+				"Expected 81 EC 04 01 00 00, got %02X %02X %02X %02X %02X %02X\r\n",
+				pLoadDrm[0], pLoadDrm[1], pLoadDrm[2],
+				pLoadDrm[3], pLoadDrm[4], pLoadDrm[5]);
+		Log("[MEMFIX]   Hook 12 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLoadDrm, pLoadDrm,
+										 (void *)Hook_LoadDrmResourceById, STEAL_LOADDRM))
+		{
+			Log("[MEMFIX] FAILED to hook LoadDrmResourceById\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked LoadDrmResourceById (idx validation)\r\n");
+		}
+	}
+
+	/* Hook 13: FUN_001a4c80 — caller-aware safe stub for FUN_0025e090.
+	 * Substitutes a static {0,0} stub when the lookup misses AND the
+	 * caller is inside FUN_0025e090's body, sidestepping that function's
+	 * check-then-deref-anyway NULL bug.  All other 100+ callers see the
+	 * unchanged NULL return. */
+	BYTE *pLookup = base + RVA_LOOKUP;
+	LogBytes("FUN_001a4c80   ", pLookup, 16);
+
+	if (pLookup[0] != 0x8B || pLookup[1] != 0x44 ||
+			pLookup[2] != 0x24 || pLookup[3] != 0x04 ||
+			pLookup[4] != 0x3D || pLookup[5] != 0x00 ||
+			pLookup[6] != 0x80 || pLookup[7] != 0x01 ||
+			pLookup[8] != 0x00)
+	{
+		Log("[MEMFIX] WARNING: FUN_001a4c80 prologue mismatch! "
+				"Expected 8B 44 24 04 3D 00 80 01 00, got "
+				"%02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+				pLookup[0], pLookup[1], pLookup[2], pLookup[3],
+				pLookup[4], pLookup[5], pLookup[6], pLookup[7],
+				pLookup[8]);
+		Log("[MEMFIX]   Hook 13 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkLookup, pLookup,
+										 (void *)Hook_FUN_001a4c80, STEAL_LOOKUP))
+		{
+			Log("[MEMFIX] FAILED to hook FUN_001a4c80\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked FUN_001a4c80 (caller-aware stub for FUN_0025e090)\r\n");
+		}
+	}
+
+	/* Hook 14: FUN_00065180 — SEH wrapper around the vtable-NULL-deref
+	 * crash in the layer immediately after the deserializer family.  The
+	 * function tail-calls a virtual function on a table-lookup result
+	 * with no NULL check; on bad save indices the lookup returns NULL
+	 * and the vtable load faults.  SEH catches and we return cleanly. */
+	BYTE *pFun65180 = base + RVA_FUN_65180;
+	LogBytes("FUN_00065180   ", pFun65180, 16);
+
+	if (pFun65180[0] != 0x53 || pFun65180[1] != 0x56 ||
+			pFun65180[2] != 0x57 || pFun65180[3] != 0x8B ||
+			pFun65180[4] != 0xF1)
+	{
+		Log("[MEMFIX] WARNING: FUN_00065180 prologue mismatch! "
+				"Expected 53 56 57 8B F1, got %02X %02X %02X %02X %02X\r\n",
+				pFun65180[0], pFun65180[1], pFun65180[2],
+				pFun65180[3], pFun65180[4]);
+		Log("[MEMFIX]   Hook 14 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkFun65180, pFun65180,
+										 (void *)Hook_FUN_00065180, STEAL_FUN_65180))
+		{
+			Log("[MEMFIX] FAILED to hook FUN_00065180\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked FUN_00065180 (SEH wrap for vtable NULL deref)\r\n");
+		}
+	}
+
+	/* Hook 15: cdc::InstanceTable::RestoreInstance — SEH wrap.
+	 * The function reads many fields off the instance descriptor
+	 * (param_1) at offsets up to 0x12c+.  Corrupted descriptors cause
+	 * any of those reads to fault.  The function ALREADY has multiple
+	 * `return 0` early-exit paths and the caller checks the return,
+	 * so SEH-catch + return 0 produces the same outcome the function
+	 * already produces for known-bad inputs: skip this instance,
+	 * continue the load. */
+	BYTE *pRestoreInst = base + RVA_RESTORE_INSTANCE;
+	LogBytes("RestoreInstance", pRestoreInst, 16);
+
+	if (pRestoreInst[0] != 0x55 || pRestoreInst[1] != 0x8B ||
+			pRestoreInst[2] != 0xEC || pRestoreInst[3] != 0x83 ||
+			pRestoreInst[4] != 0xE4 || pRestoreInst[5] != 0xF0)
+	{
+		Log("[MEMFIX] WARNING: RestoreInstance prologue mismatch! "
+				"Expected 55 8B EC 83 E4 F0, got %02X %02X %02X %02X %02X %02X\r\n",
+				pRestoreInst[0], pRestoreInst[1], pRestoreInst[2],
+				pRestoreInst[3], pRestoreInst[4], pRestoreInst[5]);
+		Log("[MEMFIX]   Hook 15 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkRestoreInst, pRestoreInst,
+										 (void *)Hook_RestoreInstance, STEAL_RESTORE_INSTANCE))
+		{
+			Log("[MEMFIX] FAILED to hook RestoreInstance\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked cdc::InstanceTable::RestoreInstance (SEH wrap)\r\n");
 		}
 	}
 
