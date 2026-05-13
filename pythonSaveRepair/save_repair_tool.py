@@ -16,19 +16,24 @@ Modes:
   --mode=scan
     Scan one save (--input NAME) or all saves (--scan-all) for uint32s
     that fall in the user-mode stack range (0x02000000-0x0FFFFFFF) or
-    the heap range (0x10000000-0x1FFFFFFF). Reports per-chunk counts
-    and top candidates. For --scan-all, prints a chronological summary
-    showing when stack-range values first appear across the user's
-    save history.
+    the heap range (0x10000000-0x1FFFFFFF). FALSIFIED as a corruption
+    detector: every save (including known-clean GAMER51) has 14-29k
+    hits in world state from legitimate engine data. Kept for forensics.
 
-    Per SUMMARY §10.4: corrupted instance counts (45M, 13M, 5M etc.)
-    all fell in the stack window; uninitialized stack memory is
-    leaking into InstanceTable->field_0x14 at save time and the writer
-    serializes the garbage faithfully.
+  --mode=scan-anomalies
+    Scan world state for the byte-class signature of the runaway writer
+    (per SUMMARY §11.2): 2KB window with %zero in [22, 30] AND %print
+    in [22, 30] — the writer dumping 4-byte values from contiguous
+    uninitialized memory (in GAMER25 produces the tight 25.0%/25.0%
+    core at 0x1fb26f). Adjacent flagged windows merge into regions.
+    Clean saves (GAMER51 baseline: 42-56% zero, 0-22% printable) hit
+    nothing. The %FF axis is NOT distinctive — normal world state has
+    3-7% FF too — so it's not part of the detector.
 
 Usage:
   python save_repair_tool.py --mode=scan --scan-all
-  python save_repair_tool.py --mode=scan --input GAMER23_4
+  python save_repair_tool.py --mode=scan-anomalies --scan-all
+  python save_repair_tool.py --mode=scan-anomalies --input GAMER25_4
   python save_repair_tool.py --mode=hybrid --broken GAMER23_4 --working GAMER63_4
 
 Safety:
@@ -76,6 +81,17 @@ DEFAULT_CHUNK_SIZE = 0x4000
 
 # Default cap on per-save "top candidates" detail listing.
 DEFAULT_TOP_N = 20
+
+# --- byte-class anomaly detection (scan-anomalies) ---
+# The runaway writer's output is bit-for-bit uniform ~25%/25% across 2KB
+# windows in the corrupted region (SUMMARY §11.2 / analyze_suspect_regions
+# output for GAMER25 0x1fb26f..0x202a6f). Clean saves in the same region
+# show 42-56% zero, 0-22% printable. The %FF axis is NOT distinctive —
+# normal world state has 3-7% FF too — so we only detect Signature A.
+ANOMALY_WINDOW = 0x800   # 2 KB
+ANOMALY_STEP   = 0x400   # 1 KB (50% overlap)
+RUNAWAY_ZERO_LO, RUNAWAY_ZERO_HI = 22.0, 30.0
+RUNAWAY_PRINT_LO, RUNAWAY_PRINT_HI = 22.0, 30.0
 
 # Strict save-file name regex: GAMER##_4, GAMEA##_4, GAMEQ##_4. Excludes
 # *_Backup, *.bak, *_pre_repair_*, "* - Copy" etc.
@@ -505,6 +521,129 @@ def cmd_hybrid(args):
     print(f"To restore {args.output}, copy {os.path.basename(bak)} back.")
 
 
+def window_byte_classes(chunk: bytes) -> tuple:
+    """Return (%zero, %FF, %printable) for a chunk."""
+    n = len(chunk)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    z = chunk.count(0) / n * 100.0
+    f = chunk.count(0xFF) / n * 100.0
+    p = sum(1 for c in chunk if 32 <= c < 127) / n * 100.0
+    return z, f, p
+
+
+def classify_window(z: float, f: float, p: float) -> str:
+    """Classify a 2KB window. 'A' = runaway-writer signature (tight 25/25), '' = normal."""
+    if (RUNAWAY_ZERO_LO <= z <= RUNAWAY_ZERO_HI
+            and RUNAWAY_PRINT_LO <= p <= RUNAWAY_PRINT_HI):
+        return "A"
+    return ""
+
+
+def scan_anomalous_regions(buf: bytes, world_start: int,
+                           window: int = ANOMALY_WINDOW,
+                           step: int = ANOMALY_STEP):
+    """Slide a window across world state and return contiguous anomalous regions.
+
+    Each region is a dict {start, end, length, dominant_type, windows: [(off, z, f, p, t), ...]}.
+    """
+    flagged = []
+    end_off = len(buf) - window + 1
+    for off in range(world_start, end_off, step):
+        z, f, p = window_byte_classes(buf[off:off + window])
+        t = classify_window(z, f, p)
+        if t:
+            flagged.append((off, z, f, p, t))
+    if not flagged:
+        return []
+
+    regions = []
+    cur = [flagged[0]]
+    for entry in flagged[1:]:
+        last_end = cur[-1][0] + window
+        if entry[0] <= last_end:
+            cur.append(entry)
+        else:
+            regions.append(_finalize_region(cur, window))
+            cur = [entry]
+    regions.append(_finalize_region(cur, window))
+    return regions
+
+
+def _finalize_region(windows: list, window_size: int) -> dict:
+    start = windows[0][0]
+    end = windows[-1][0] + window_size
+    types = [w[4] for w in windows]
+    dom = max(set(types), key=types.count)
+    return {"start": start, "end": end, "length": end - start,
+            "dominant_type": dom, "windows": windows}
+
+
+def cmd_scan_anomalies(args):
+    """Byte-class anomaly scanner (Phase A1, take 2)."""
+    boundary = int(args.boundary, 0)
+
+    if args.scan_all:
+        files = sorted(list_save_files(args.saves_dir), key=lambda x: x[2])
+        if not files:
+            print(f"No save files matched in {args.saves_dir}")
+            return
+        print(f"Scanning {len(files)} saves for byte-class anomalies in {args.saves_dir}")
+        print(f"World-state start : {boundary:#x}")
+        print(f"Window/step       : {ANOMALY_WINDOW}/{ANOMALY_STEP} bytes")
+        print(f"Signature A       : %zero in [{RUNAWAY_ZERO_LO:.0f}, {RUNAWAY_ZERO_HI:.0f}] AND "
+              f"%print in [{RUNAWAY_PRINT_LO:.0f}, {RUNAWAY_PRINT_HI:.0f}]  (runaway writer)")
+        print()
+
+        rows = []
+        for name, path, mtime in files:
+            try:
+                buf = read_save(path)
+            except (ValueError, zlib.error) as e:
+                rows.append((name, mtime, None, None, None, "", str(e)))
+                continue
+            regions = scan_anomalous_regions(buf, boundary)
+            n = len(regions)
+            tot = sum(r["length"] for r in regions)
+            first = regions[0]["start"] if regions else None
+            types = "".join(sorted({r["dominant_type"] for r in regions})) or "-"
+            rows.append((name, mtime, n, tot, first, types, None))
+
+        print("=== cross-save anomaly summary (chronological by mtime) ===")
+        hdr = (f"{'name':<14}  {'mtime':<19}  {'regions':>7}  "
+               f"{'tot_bytes':>9}  {'first_off':>10}  types")
+        print(hdr)
+        print("-" * len(hdr))
+        for name, mtime, n, tot, first, types, err in rows:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+            if err:
+                short = err if len(err) < 50 else err[:47] + "..."
+                print(f"{name:<14}  {ts:<19}  SKIP: {short}")
+                continue
+            f_str = f"{first:#010x}" if first is not None else "-"
+            marker = "  <-- ANOMALY" if n > 0 else ""
+            print(f"{name:<14}  {ts:<19}  {n:>7}  {tot:>9,}  {f_str:>10}  {types}{marker}")
+        return
+
+    name = args.input
+    if not name:
+        raise SystemExit("--mode=scan-anomalies requires --input <save> or --scan-all")
+    path = os.path.join(args.saves_dir, name)
+    print(f"Scanning {path} for byte-class anomalies")
+    print(f"World-state start: {boundary:#x}")
+    print()
+    buf = read_save(path)
+    regions = scan_anomalous_regions(buf, boundary)
+    print(f"{len(regions)} anomalous region(s) in world state:")
+    for i, r in enumerate(regions):
+        print()
+        print(f"--- region #{i}: {r['start']:#x}..{r['end']:#x}  "
+              f"len={r['length']:,}  dominant={r['dominant_type']} ---")
+        print(f"  {'offset':>10} {'%zero':>6} {'%FF':>6} {'%print':>6} type")
+        for off, z, f, p, t in r["windows"]:
+            print(f"  {off:>#10x} {z:>6.1f} {f:>6.1f} {p:>6.1f}  {t}")
+
+
 def cmd_scan(args):
     """Scan one or all saves for stack/heap-range uint32 hits."""
     boundary   = int(args.boundary, 0)
@@ -584,9 +723,12 @@ def cmd_scan(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=("hybrid", "scan", "read"), default="hybrid",
+    ap.add_argument("--mode",
+                    choices=("hybrid", "scan", "scan-anomalies", "read"),
+                    default="hybrid",
                     help="hybrid: graft progression+worldstate (legacy). "
-                         "scan: read-only stack/heap-range uint32 hits. "
+                         "scan: read-only stack/heap-range uint32 hits (falsified). "
+                         "scan-anomalies: detect runaway-writer byte-class signature. "
                          "read: forensic XP/praxis/inventory readout for comparison.")
     ap.add_argument("--saves-dir", default=DEFAULT_SAVES_DIR,
                     help=f"folder containing GAMER##_4 files "
@@ -627,6 +769,8 @@ def main():
         cmd_hybrid(args)
     elif args.mode == "scan":
         cmd_scan(args)
+    elif args.mode == "scan-anomalies":
+        cmd_scan_anomalies(args)
     elif args.mode == "read":
         cmd_read(args)
 
