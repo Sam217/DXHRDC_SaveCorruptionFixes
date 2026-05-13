@@ -142,6 +142,43 @@ the class as `InstanceTable` for our purposes.
 | `0x0ECC00` | `cdc::InstanceTable::SaveToStream(stream)` | **Structurally sane** — reads from `this->[+0x4]` (flag), `this->[+0x14]` (count), `this->[+0x1C+i*8]` (entries) and writes them. Two-pass count-then-write pattern (`stream[3] != 0` = counting mode). **But `this->[+0x14]` may be garbage in memory at save time → corruption propagates.** |
 | `0x0ECC80` | `cdc::InstanceTable::RestoreInstance(desc)` | 🪝 Hook 15 SEH. Reads MANY fields off `desc + 0x11C..+0x12C+`. If `desc` is corrupt, reads fault. Function already has multiple `return 0` early-exits; SEH-catch + return 0 has same semantic ("skip this instance"). Caller's loop checks return value. |
 | `0x0ECEB0` | `cdc::InstanceTable::LoadFromStream(stream)` | 🪝 Hook 5 (with stream-exhaustion fix `fcb20dd`). ⚠️ Initializes `puVar1 = param_1` (a stack pointer = ~`0x02BDXXXX`) **BEFORE** conditionally reading the count from stream. When stream exhausted, count read is skipped → loop runs ~45M times. Our hook: detects `pos+5 > total` → early return without calling original. Also caps count to `MAX_INSTANCES = 50000`. |
+| `0x0ECF60` | InstanceTable constructor `FUN_000ecf60(this, ctx)` | Writes `cdc::DeferredLightComponent::vftable` to `*this`. Initializes 32-byte struct: type_flag=1, ctx_ptr, records_base from `ctx->[+0x130]`, count=0, capacity=0, buffer=literal `7` (sentinel). |
+| `0x0ECFB0` | InstanceTable destructor `FUN_000ecfb0(this)` | Cleanup. Calls `FUN_000ECE70` (clear-all) then frees auxiliary state. |
+| `0x0ECE70` | `cdc::InstanceTable::Clear(this)` | Iterates count×8-byte records at `this->[+0x1C]`, calls `FUN_00207E60` for each non-null entry, then sets count=0. |
+| `0x002093B0` | Scene-entity constructor `FUN_002093b0` | If `entity->ctx[+300] != 0`, allocates 32 bytes via `MemHeapAlloc(0x20, 0)`, calls `FUN_000ECF60(entity)`, stores InstanceTable ptr at **`entity + 0x30c`**. |
+| `0x00208880` | Scene-entity destructor `FUN_00208880` | Reads `entity[0xc3]` (= `entity+0x30c`); if non-null calls `FUN_000ECFB0` then frees the 32-byte block. |
+
+### InstanceTable struct layout (32 bytes)
+
+Each instance is **32 bytes** = 8 `u32` slots. Constructor `FUN_000ECF60`
+and the read-pattern in SaveToStream/LoadFromStream confirm:
+
+| Offset | Field | Notes |
+|---|---|---|
+| `+0x00` | `vtable` ptr | Points into `cdc::DeferredLightComponent::vftable`. SaveToStream slot at `DAT_006955C4`, LoadFromStream slot at `DAT_006955C8`. |
+| `+0x04` | `type_flag` (byte) | Constructor sets to `1`. SaveToStream serializes 1 byte from here. |
+| `+0x08` | `context` ptr | Owning entity/scene context. |
+| `+0x0c` | `ctx_field_300` | Cached `*(int*)(ctx[8] + 300)`. |
+| `+0x10` | **`records_base` ptr** | Pointer to an array of **0x130-byte (304-byte)** instance records. LoadFromStream computes `records_base + idx*0x130` and passes that to `RestoreInstance`. |
+| `+0x14` | **`count`** | Active-instance count. **This is the field that gets corrupted at gameplay time** (→ Bug A in SUMMARY §11.5). Constructor inits to 0; `DynArray_PushBack_8bytes` increments. |
+| `+0x18` | `capacity` | DynArray capacity. Constructor inits to 0. |
+| `+0x1c` | `buffer` ptr | Points to an array of **8-byte (saved_idx, instance_ptr) pairs**. SaveToStream writes only the first 4 bytes (saved_idx) of each pair. Constructor inits to literal `7` (sentinel — real ptr installed on first PushBack). |
+
+### Two strides to remember
+
+- **Instance records** at `this->records_base` (= `+0x10`): **`0x130` = 304 bytes** each. LoadFromStream multiplies the saved index by `0x130` to compute the per-instance pointer passed to `RestoreInstance`.
+- **DynArray pairs** at `this->buffer` (= `+0x1c`): **8 bytes** each (saved_idx u32, restored_instance_ptr u32). SaveToStream serializes only the saved_idx half; the instance_ptr is reconstructed at load by `RestoreInstance`.
+
+### Per-entity ownership
+
+Every "deferred-light-capable" scene entity owns its OWN 32-byte
+InstanceTable at offset `+0x30C`. The game has many such entities
+(player, NPCs, lights, props); each has an independent `count`. **A
+single corrupt save can have multiple InstanceTables with garbage
+counts** — the corruption is per-entity, not global. The 96 KB + 24 KB
+anomalous regions observed in GAMER25 (SUMMARY §11.2) likely come
+from two different entities' SaveToStream calls each emitting a
+runaway loop.
 
 ### Stream object layout (the `stream` arg to all of these)
 ```
@@ -327,6 +364,64 @@ catches the idx=0 case earlier at `LoadDrmResourceById` level.
 
 ---
 
+## Subsystem 9: Inventory (PC layout)
+
+Mapped via CheatEngine (live-game scan for painkiller count) + Ghidra
+decompile of the two reported access RVAs (SUMMARY §11.3).
+
+### Functions
+
+| RVA | Symbol | Notes |
+|---|---|---|
+| `0x003F012A` | (read site inside `FUN_003efe70`) | UI-event dispatcher building an `"AddItem"` event. Reads count as `MOVZX/MOV ECX, [EAX + 6]` (**uint16 at offset +6 of a UI-display struct**). Not the canonical inventory storage. |
+| `0x0037611A` | (write site inside `FUN_003760f0`) | "Consume N items from slot K" function. Reads & writes `*(ushort *)(base + slot*0x28 + 0x0E)`. **This is the primary inventory storage.** |
+
+### Primary inventory storage layout
+
+The base pointer is per-instance (entity context); each record is
+**40 bytes** (`0x28`). Confirmed fields from `FUN_003760f0`:
+
+| Within-record offset | Field |
+|---|---|
+| `+0x00..+0x07` | (not observed) — likely flags / category / item-id ref |
+| `+0x08..+0x0B` | int (`base[slot*10 + 2]`) — possibly "secondary buffer ptr" or stack count |
+| `+0x0E..+0x0F` | **`count` (uint16)** |
+| ... | (other fields up to `+0x27`) |
+
+### PC vs Xbox 360 save format divergence
+
+Earlier sessions assumed the Xbox 360 save editor (Deus Ex Editor v3.6,
+`form1.cs`) patterns applied to PC. They **do not** for inventory:
+
+- ✅ Item-ID dictionary (3-byte BE values like `00 1F 51` for
+  Painkillers) is reusable. IDs appear verbatim in PC saves.
+- ❌ Framing bytes `<ID>01` (normal) / `<ID>0101` (upgraded) are
+  ABSENT in PC saves.
+- ❌ "Count adjacent to ID at offset +5" is wrong. PC stores the count
+  in a separate 40-byte slot record at `+0x0E`, **not** adjacent to
+  any item ID. The 3-byte IDs that do appear in PC saves are inside a
+  static item-database table (`0x0a8916` in our samples) and a few
+  per-area loot/state tables — they are reference data, not the
+  player's inventory.
+
+A working PC save editor would need to walk the primary 40-byte-record
+array, map slot→item by reading the appropriate ID field within the
+40-byte record (location unverified — would require another CheatEngine
+trace finding the read site for the ID, similar to the count trace).
+
+### Confirmed in this session
+
+The user's GAMER25 controlled experiment (hacked painkillers from 4→12
+in CE, then saved) **did not** produce an obvious `4 → 12` change in the
+expected `<ID>` patterns — confirming the format divergence. The
+BE-uint16 sweep found 8 offsets across the whole 2.3 MB buffer where
+GAMER51 reads 4 and GAMER25 reads 12; **none in the progression
+header** — suggesting the actual inventory primary storage may sit
+elsewhere (possibly in world-state region, owned by some entity's
+component table, not the progression header).
+
+---
+
 ## Globals reference
 
 | RVA | Symbol | Description |
@@ -335,7 +430,7 @@ catches the idx=0 case earlier at `LoadDrmResourceById` level.
 | `0x00A9A43C` | (DRM lookup global) | `*(int**)+0x18` = DRM-resource-table base; `[+0x00]` = max_id, `[+0x04]` = data buffer, entries at `[+idx*8]` |
 | `0x015806E8` | (small-id object table) | Used by `FUN_001A4C80`. Indexed by id (id < 0x18000). |
 | `0x006A1C50` | `cdc::MemHeapAllocator` vtable | `+0x5C` PrimaryAlloc · `+0x60` PrimaryAllocAligned · `+0x34` FallbackAlloc · `+0x4C` GetTotalCapacity · `+0x58` GetUsedBytes |
-| `0x006955C4` | `cdc::InstanceTable`/`DeferredLightComponent` vtable | `+0x00` SaveToStream · `+0x04` LoadFromStream |
+| `0x006955C4` | `cdc::InstanceTable`/`DeferredLightComponent` vtable | `+0x00` SaveToStream (`0x0ECC00`) · `+0x04` LoadFromStream (`0x0ECEB0`). Owners: per-scene-entity 32-byte InstanceTable at `entity + 0x30C`. |
 | `0x00A1F148` | (security cookie) | `__security_cookie`, used by all `/GS` functions. |
 | `0x00A5B530` | (DRM filename prefix) | First arg to `_sprintf` in `BuildDrmFilename`. |
 | `0x006A1A70` | "ERROR: Out of memory, %s requested..." format | OOM error string used by `MemHeapAllocator::Allocate`. |
@@ -356,9 +451,9 @@ See SUMMARY §10 for full discussion. Quick form:
 | Encryption | none |
 | Checksum/signature | none |
 | Header `[0..4)` | uint32 LE = "data length" (varies per save; perhaps where engine zero-pads) |
-| Inventory record | 9 bytes: `[ID 3B BE | 00 00 | DATA 2B | 00 00]` |
-| Item IDs (3B BE) | match Xbox 360 save editor (e.g., painkillers `0x001F51`) |
-| Snapshots per save | ~6 redundant copies of inventory/aug data |
+| Item IDs (3B BE) | DO appear verbatim in PC saves (e.g., painkillers `00 1F 51`) — borrowed from Xbox 360 save editor's catalog |
+| Inventory record framing | ⚠️ **NOT** the Xbox 360 `<ID>01` / `<ID>0101` framing (SUMMARY §11.2.4). PC stores **primary inventory** as a flat 40-byte (`0x28`) record array indexed by **slot**, with count at `slot*0x28 + 0x0E` (uint16). The 3-byte ID is **not co-located** with the count in any single record. See §"Subsystem 9: Inventory" below. |
+| Redundant snapshots | At least one stride confirmed: `0x2800` (10,240 bytes) between two snapshots of an XP/praxis-or-similar field (SUMMARY §11.2 GAMER51↔53 diff). Total count unverified — earlier "~6 snapshots" claim came from dnSpy and may not apply to PC. |
 
 ### File regions (empirical from GAMER63 vs GAMER23 diff)
 
@@ -408,22 +503,49 @@ When a new crash signature shows up, the playbook is:
 
 ## Open questions / things not investigated
 
-- Save format **chunk structure** — we know it's a `0x23A000` flat
-  buffer with mixed regions, but the engine probably parses it as a
-  series of (tag, size, data) chunks. Identifying chunk boundaries
-  would let a repair tool target specific sections (HUD, inventory,
-  instances) rather than blunt-zero everything in stack-address range.
+### Resolved this session (2026-05-13)
+
+- ~~"6 snapshots in one save" observation~~ — Partly resolved. At least
+  one redundant-snapshot stride is `0x2800` (10,240 bytes); observed
+  between two paired diff hits in the GAMER51↔53 progression header.
+  How many total copies + which fields use redundancy is still
+  unverified for PC; the earlier "~6 copies" claim came from dnSpy and
+  may have been Xbox-specific.
+- ~~InstanceTable struct layout~~ — **Resolved.** 32 bytes; see
+  Subsystem 3 above.
+- ~~Inventory format on PC~~ — **Partially resolved.** Primary
+  storage is a 40-byte-record array with count at `slot*0x28 + 0x0E`
+  (uint16). Slot→item-id mapping not yet decoded — would need another
+  CheatEngine trace.
+
+### Still open
+
+- **The writer-side corruption mechanism (SUMMARY §11.5 Bug A).** What
+  during gameplay corrupts the `count` field of a deferred-light
+  entity's InstanceTable? Candidates: stack-leak via uninitialized
+  local; OOB write from an adjacent allocation; use-after-free on a
+  recycled entity slot. To investigate: CheatEngine memory-write
+  breakpoint on `entity[0x30C] + 0x14` of a live deferred-light
+  entity (SUMMARY §11.6 Path C).
+- **Number of corrupted InstanceTables per bad save.** GAMER25 has
+  one 96 KB anomaly and one 24 KB anomaly — could be two entities or
+  one with two write phases. Hook 16's logging would answer this by
+  printing `_ReturnAddress()` for each clamped count.
+- **What lives at file-offset `0x1f8a6f` and `0x211355`** — the two
+  GAMER25-vs-GAMER51 anomalous regions. Which entity's InstanceTable
+  serializes there? This maps the corruption to a specific subsystem
+  (which lights/components).
+- Save format **chunk structure** — engine probably parses the
+  `0x23A000` buffer as a series of (tag, size, data) chunks but
+  boundaries not yet enumerated. Identifying chunk boundaries would
+  let a repair tool target specific sections.
 - The **save-index file** — separate from the save-content files,
   determines which slots are valid. Location and format unknown to
   us. There's a small GitHub project addressing it (TODO: link).
-- Why the **101 KB chunk** (`102400 = 0x19000`) appears as the "total"
-  in the exhausted `LoadActiveGroups` stream — likely the section size
-  reserved for HUD active groups in the save format. Could confirm by
-  searching for this length value across saves.
-- The **"6 snapshots in one save"** observation — we see ~6 redundant
-  copies of inventory blocks per save. Maybe quicksave + autosave +
-  recent overrides + ... ? Or just multiple game-state subsystems
-  each writing their own copy? Worth understanding for repair work.
+- Why the **101 KB chunk** (`102400 = 0x19000`) appears as the
+  exhausted-stream `total` — likely the section size reserved for HUD
+  active groups or one InstanceTable's allocated sub-stream. Could
+  confirm by searching for this length value across saves.
 - The **DC-vs-original-DXHR** content additions. We've noticed
   `cdc::InstanceTable::LoadFromStream` exists in both at similar RVAs
   (DC: `0xECEB0`, dxhr: `0xED260`, ~+0x1000 offset). The buggy bounds

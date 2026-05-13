@@ -1108,3 +1108,348 @@ load instead of at load time".
 GAMER22_4 currently still contains the failed hybrid. To restore the
 original, copy `GAMER22_4_pre_repair_20260507_075945` back. The
 pre-existing `GAMER22_4_Backup` is also untouched.
+
+
+## 11.2 Forensic byte-diff investigation (2026-05-13)
+
+After the hybrid-graft failure and the stack-address scan (Phase A1)
+disproved the "surgical zero-patch" hypothesis (every save legitimately
+contains 19K–38K uint32s in `0x02xxxxxx–0x0Fxxxxxx` because the engine
+serializes integers as **big-endian on disk** — Xbox 360 PowerPC
+legacy), we pivoted to a pure byte-diff between known-corrupt and
+known-clean save pairs to localize the corruption.
+
+### 11.2.1 Tooling
+
+Three Python tools in `pythonSaveRepair/`:
+- `diff_pair.py <save_a> <save_b>` — generic byte-diff, area-name
+  extraction at `0x5045`, range bucketing into progression header
+  (`<0xF0000`) and world state (`≥0xF0000`), top-N largest world-state
+  ranges plus stack/heap-range uint32 LE sniff per range.
+- `diff_prog_zoom.py` — full hex+ASCII context for progression-header
+  diffs (one-shot GAMER50/51).
+- `analyze_suspect_regions.py` — drills into specific world-state
+  regions with per-2KB byte-class statistics (`%zero`, `%FF`,
+  `%print`), and a targeted painkiller-count change search.
+
+All saves at `<repo>/238010/<userid>/238010/remote/`.
+
+### 11.2.2 Three save pairs analyzed
+
+| Pair | Same area? | Playtime apart | Outcome |
+|------|------------|----------------|---------|
+| GAMER50 (corrupt) ↔ GAMER51 (self-healed) | No (area transition) | 18 min | Progression header **bit-identical except** file checksum, area-name string, time counter, Adam's XYZ position float, orientation. 13.15% world-state differs (legitimate gameplay). |
+| GAMER51 (clean) ↔ GAMER53 (crashes) | Yes (`port_2a`) | ~21 s | 15.42% differs; world-state still noisy. Progression-header showed `0x50c3: 01→00` flag flip + a 32-bit time counter +1.5M + redundant snapshots at `0x2800` stride. |
+| GAMER51 (clean) ↔ GAMER25 (newly corrupt) | Yes (`port_2a`) | 15 m of movement + painkillers hacked 4→12 | **10.10% differs** — tightest pair. Localized corruption to TWO world-state regions: `0x1f8a6f` (96 KB) and `0x211355` (24 KB). Statistically uniform "25.0% zero / 25.0% printable" fill across 20+ consecutive 2KB windows in the corrupt save — the signature of a **runaway writer loop**. |
+
+### 11.2.3 Headline finding
+
+**Progression data is fully intact in corrupt saves.** GAMER50's
+progression header (offsets `0x0–0xF0000`) is byte-identical to
+GAMER51's, except for: file checksum, area-name, area-header timestamps,
+Adam's position/orientation floats. XP, praxis points, inventory,
+augmentations — every byte the same.
+
+This kills two earlier worries:
+- Saves are NOT lossy on progression data.
+- The visible in-game brokenness (HUD, doors, augs not firing) is
+  **misrender of intact data**, not data loss.
+
+The corruption lives entirely in the world-state region. Specifically,
+in the `cdc::InstanceTable` save sub-streams owned by deferred-lighting
+scene entities.
+
+### 11.2.4 Painkiller hack 4→12: failed locator + key negative result
+
+We had a controlled change between GAMER51 (painkillers=4) and GAMER25
+(hacked to 12 via CheatEngine, then saved). Searched for:
+- The 3-byte ID `00 1F 51` (Painkillers per the Xbox 360 form1.cs).
+- Any uint16 BE/LE offset where GAMER51 reads 4 and GAMER25 reads 12.
+
+Results:
+- Painkillers ID `00 1F 51` appears 8 times in GAMER51 and 6 times in
+  GAMER25; offsets mostly different between the saves; **none** of the
+  occurrences have `00 04` (GAMER51) or `00 0C` (GAMER25) at the offsets
+  the Xbox 360 editor expects (`<ID>01`, `<ID>0101`).
+- BE-uint16 sweep over the whole buffer: 8 offsets where (GAMER51=4,
+  GAMER25=12); none in progression header.
+
+**Conclusion: the dnSpy/Xbox-360 inventory format does NOT apply to PC
+saves.** The PC layout stores count separately from the item ID,
+indexed by slot number (confirmed later via Ghidra; see §11.4).
+
+
+## 11.3 CheatEngine: inventory access points
+
+Once the dnSpy patterns failed, we ran CheatEngine on the live game to
+find runtime addresses for Painkillers and used "find what reads/writes"
+to get the engine's actual access RVAs.
+
+| RVA (`DXHRDC.exe+`) | What | Operand | Notes |
+|---------------------|------|---------|-------|
+| `0x003F012A` | Reads painkiller count when opening inventory menu | `MOVZX/MOV ECX, [EAX+06]` | UI-display struct, **count at +6 (uint16)**. Inside `FUN_003efe70` (an "AddItem" UI dispatcher). |
+| `0x0037611A` | Writes painkiller count when consuming items | `MOV [EAX+...], reg` (via `param_1_00 + slot*0x28 + 0x0e`) | **Primary inventory storage**: 40-byte records, count at offset `0x0e` within each record. Inside `FUN_003760f0`. |
+
+Painkiller count is **uint16** (2 bytes) — initial 32-bit scan failed,
+16-bit scan succeeded.
+
+The two access sites operate on different struct layouts: an
+intermediate UI struct (count at +6) and the primary inventory storage
+(40-byte records, count at +0x0e). The `[eax+06]` in CheatEngine is the
+UI-side intermediary, not where the canonical count lives.
+
+CheatEngine pointer-scan was attempted but no reliable static base was
+captured this session. Deferred — Ghidra's static decompile gave enough
+to proceed without it.
+
+
+## 11.4 Ghidra: InstanceTable subsystem confirmed
+
+Decompiled the three pivotal functions via GhidraMCP. The Ghidra
+project loads `DXHRDC.exe` with image base `0x00000000`, so CheatEngine
+RVAs map directly to Ghidra addresses.
+
+### 11.4.1 `cdc::InstanceTable::SaveToStream` — RVA `0x000ECC00`
+
+```c
+void cdc::InstanceTable::SaveToStream(this, stream) {
+    write_byte(stream, *(byte*)(this + 4));                 // 1B type flag
+    uVar1 = *(uint *)(this + 0x14);                          // count
+    write_uint32(stream, uVar1);
+    for (uVar2 = 0; uVar2 < uVar1; uVar2++) {
+        write_uint32(stream,
+            *(uint*)(*(int*)(this + 0x1c) + uVar2 * 8));     // entry idx
+    }
+}
+```
+
+Confirmed exactly as SUMMARY §10.4 predicted: `[1B flag][4B count]
+[count × 4B index]`. Records in the source buffer at `this+0x1c` are
+8-byte stride, but only the first 4 bytes (the index) are written.
+
+### 11.4.2 `cdc::InstanceTable::LoadFromStream` — RVA `0x000ECEB0`
+
+```c
+puVar1 = param_1;                                            // ← stack ptr leak
+puVar3 = param_1;
+if (*param_1 + 4 <= param_1[1]) {                            // stream has 4 bytes?
+    puVar1 = *(uint **)param_1[2];                           // read count (only if room)
+    ...
+}
+for (; puVar1 != (uint*)0; puVar1 = (uint*)((int)puVar1 - 1)) {
+    if (*param_1 + 4 <= param_1[1]) puVar3 = read_uint32(stream);
+    iVar2 = RestoreInstance((int)puVar3 * 0x130 + *(int*)(param_1_00 + 0x10));
+    if (iVar2 != 0) DynArray_PushBack_8bytes(&local_8);
+}
+```
+
+The bug already documented in `DXHRDC_engine_RE.md`: `puVar1` is
+initialized to the stack pointer (~`0x02BDxxxx` ≈ 45M) BEFORE the
+conditional count-read. If stream is exhausted at count-read, `puVar1`
+keeps its initial garbage value and the loop runs ~45M times.
+
+Each iteration's index `puVar3` is multiplied by `0x130 = 304` and
+added to the records base at `this+0x10` to get an instance pointer
+passed to `RestoreInstance`. **Records are 304 bytes** = the canonical
+"deferred light instance" struct size.
+
+### 11.4.3 `cdc::InstanceTable::RestoreInstance` — RVA `0x000ECC80`
+
+Restores ONE 304-byte instance from a description: `FUN_000efe30`,
+`FUN_000edbc0`, `FUN_0020aaf0`, sets bit `0x200` at `iVar4+0x168`,
+calls `FUN_00206240`, etc. Not symmetric with SaveToStream — that
+function only writes indices, while RestoreInstance instantiates a
+full object from a static description table indexed by the saved
+index.
+
+### 11.4.4 The InstanceTable struct (32 bytes)
+
+From the constructor at RVA `0x000ECF60` (`FUN_000ecf60`):
+
+```c
+*param_1_00 = cdc::DeferredLightComponent::vftable;          // [+0x00] vtable ptr
+*(byte*)(param_1_00 + 1) = 1;                                // [+0x04] type flag = 1
+param_1_00[2] = param_1;                                      // [+0x08] context ptr
+param_1_00[3] = *(u32*)(**(int**)(param_1 + 8) + 300);        // [+0x0c] derived from ctx
+param_1_00[4] = *(u32*)(**(int**)(param_1 + 8) + 0x130);      // [+0x10] records base (304B stride)
+param_1_00[5] = 0;                                            // [+0x14] count = 0
+param_1_00[6] = 0;                                            // [+0x18] capacity = 0
+param_1_00[7] = 7;                                            // [+0x1c] buffer (sentinel literal 7)
+```
+
+| Offset | Field | Notes |
+|--------|-------|-------|
+| `+0x00` | vtable ptr | `cdc::DeferredLightComponent::vftable`; SaveToStream slot at `DAT_006955C4`, LoadFromStream slot at `DAT_006955C8`. |
+| `+0x04` | type flag (byte) | Constructor sets to `1`. SaveToStream serializes it. |
+| `+0x08` | context ptr | Points to owning entity context. |
+| `+0x0c` | derived | From `context->300`. |
+| `+0x10` | records base ptr | Points to array of **304-byte** instance records. |
+| `+0x14` | **count** | DynArray<8-byte-pair> count. **This is the field that gets corrupted.** |
+| `+0x18` | capacity | DynArray capacity. |
+| `+0x1c` | buffer ptr | DynArray buffer of **8-byte (idx, instance_ptr) pairs**. Constructor sentinel = literal `7`; real ptr installed on first PushBack. |
+
+### 11.4.5 Owner: per-scene-entity InstanceTable at offset `+0x30c`
+
+From the scene-entity constructor `FUN_002093b0` (RVA `0x002093B0`):
+
+```c
+if (*(int*)(**(int**)(param_1 + 8) + 300) != 0) {
+    iVar3 = MemHeapAlloc(0x20, 0);                            // alloc 32 bytes
+    if (iVar3 != 0) uVar5 = FUN_000ecf60(param_1);            // = InstanceTable ctor
+    *(int*)(param_1 + 0x30c) = uVar5;                          // stored at entity+0x30c
+}
+```
+
+Symmetric destruction in `FUN_00208880` (RVA `0x00208880`):
+```c
+iVar4 = param_1[0xc3];                                          // param_1[0xc3]*4 = 0x30c
+param_1[0xc3] = 0;
+if (iVar4 != 0) {
+    FUN_000ecfb0();                                             // dtor at RVA 0x000ECFB0
+    MemHeapFree(iVar4);
+}
+```
+
+So **every "deferred-light-capable" scene entity owns its own 32-byte
+InstanceTable at `entity+0x30c`**. The game has many such entities;
+each has an independent count. Multiple corruption sites possible.
+
+### 11.4.6 Vtable layout (`DAT_006955C4`)
+
+The two adjacent xref hits confirm the vtable structure:
+- `006955C4` → SaveToStream (`0x000ECC00`)
+- `006955C8` → LoadFromStream (`0x000ECEB0`)
+
+Other slots exist (the constructor writes a full vtable pointer, not
+just two slots) but were not enumerated this session.
+
+
+## 11.5 Two-bug model finalized
+
+The previous "field_0x14 stack-leak" theory (SUMMARY §10.4) is partly
+right but missed a second bug. The full picture is **two stacked bugs**:
+
+### Bug A — Writer-side corruption (root cause; still unfixed)
+
+During gameplay, the `count` field at `instance_table+0x14` of one or
+more deferred-light scene entities is corrupted to a garbage value
+(hundreds of thousands to tens of millions). When SaveToStream runs, it
+**faithfully serializes** that garbage count and then iterates that many
+times, reading 4 bytes per iteration from progressively-further memory
+past the actual buffer end at `this+0x1c`. The stream eventually fills
+up.
+
+This is what produces the 96 KB + 24 KB **statistically-uniform
+anomalous regions** in GAMER25's world-state (see §11.2.2). The 25.0%
+zero / 25.0% printable pattern is the signature of out-of-bounds reads
+into structured-but-unrelated memory being dumped to the save stream.
+
+The corruption is deterministic in the sense that progression header
+remains untouched, but non-deterministic in the sense that GAMER51 and
+GAMER25 (15 m apart in `port_2a`) differ by 10% in world state — the
+writer corrupts a different mix of fields each time.
+
+**Mechanism not yet identified.** Likely candidates:
+- Stack-leak into adjacent InstanceTable struct via an uninitialized
+  local variable somewhere in the gameplay update path.
+- Out-of-bounds write from an unrelated allocation that lands on
+  `entity+0x30c+0x14`.
+- Use-after-free where a recycled entity slot's `+0x30c` field still
+  points to a now-corrupted 32-byte block.
+
+### Bug B — Loader-side amplification (mitigated by Hook 5)
+
+`cdc::InstanceTable::LoadFromStream` initializes its count variable
+`puVar1` to a stack pointer BEFORE conditionally reading the count
+from the stream. If the stream is exhausted at the point the count
+should be read, `puVar1` retains its initial value (~45M) and the
+restore loop iterates that many times.
+
+This is the bug Hook 5 (`fcb20dd`) caught. The hook detects
+`pos+5 > total` and skips the call entirely, preventing the crash but
+leaving that subsystem's state empty.
+
+### How they stack on a load
+
+1. Corrupt save's first InstanceTable serializes ~100 KB of garbage
+   indices, overconsuming the world-state sub-stream allocated to it.
+2. The next InstanceTable in the deserialization chain finds the
+   stream already exhausted.
+3. Without Hook 5: garbage count is read from uninitialized stack,
+   loop spins 45M times calling `RestoreInstance` with bad pointers
+   → crash.
+4. With Hook 5: skip the call. Subsystem state is empty. HUD,
+   inventory menu, doors, augmentation triggers all fail because they
+   depend on light-instance state that was never restored.
+
+### Why this matches the in-game symptoms
+
+- HUD doesn't render: HUD draws are gated on certain light/scene
+  instances being present.
+- Doors don't open: interaction prompts rely on entity instance
+  registry.
+- Augmentations don't fire: the higher-jump aug's effect requires
+  the InstanceTable for the player's effect-component to be live.
+
+All three are downstream of empty InstanceTables.
+
+
+## 11.6 Decision: Path B (preventive) + Path C (root cause)
+
+Three options were on the table at end of session:
+
+- **Path A — Continue Ghidra RE to find writer bug.** High effort,
+  uncertain payoff; the writer-side leak source could be anywhere in
+  the gameplay tick.
+- **Path B — Hook 16: save-time validator.** Hook
+  `cdc::InstanceTable::SaveToStream` at RVA `0x000ECC00`. Before
+  calling the original, validate `*(uint*)(this+0x14)`. If
+  `> MAX_INSTANCES` (e.g., 50000) OR in stack/heap address windows,
+  clamp to `0`. Prevents new corrupt saves from being created.
+  ~60 lines of C, mirrors Hook 5's logic.
+- **Path C — CheatEngine memory-write breakpoint.** Find a live
+  InstanceTable struct in a running game, set a write breakpoint on
+  the count field at `entity+0x30c+0x14`, play until corruption
+  strikes. Reveals the exact instruction that writes garbage.
+
+**Chosen path: B + C in parallel** at next session. B gives the user
+working saves going forward (existing saves remain broken until
+re-played past bad spots). C gives the root cause we need to fix the
+upstream bug entirely.
+
+### Practical next steps (for next session)
+
+1. **Implement Hook 16** in `version_proxy.c`:
+   - Hook `cdc::InstanceTable::SaveToStream` at RVA `0x000ECC00`.
+   - Prologue stolen bytes: TBD (need disassembly of first 5+ bytes).
+   - In the hook: read `*(uint*)(this + 0x14)`; if it's `> 50000` OR
+     in `0x02000000–0x0FFFFFFF` (stack range) OR `0x10000000–0x1FFFFFFF`
+     (heap range), log + clamp to 0 in-place before passing through.
+   - Also log `_ReturnAddress()` and a snapshot of nearby fields so we
+     correlate corruption with chapter/area as the user plays.
+2. **Memory-write breakpoint hunt** in CheatEngine:
+   - Load a clean save, find any scene entity with `entity[0x30c] != 0`
+     (a deferred-light entity).
+   - Inspect `entity[0x30c] + 0x14` — should be a small uint.
+   - Set "find what writes to this address" breakpoint.
+   - Play 5–10 min in an area known to corrupt. When the breakpoint
+     fires on a write of a garbage value, the disassembly shows the
+     leaking instruction.
+3. **Tooling cleanup**: `diff_pair.py` and `analyze_suspect_regions.py`
+   are session diagnostics — keep as-is, no integration into
+   `save_repair_tool.py` yet.
+
+### What's not on the table anymore
+
+- File-level hybrid graft of progression+world-state regions (§11.1).
+- Surgical stack-address zero-patch (§10.4 / Phase A1) — disproved
+  because legitimate BE-encoded small ints saturate that address
+  window.
+- Reading inventory from the save via dnSpy/Xbox-360 patterns
+  (§11.2.4) — PC format is structurally different (40-byte records,
+  count at +0x0e, indexed by slot rather than co-located with ID).
+- Reconstructing a working save by transplanting progression onto a
+  clean modhook-debug-menu donor (Phase B from original plan). Now
+  unnecessary because progression is intact in the corrupt saves;
+  fixing the loader path (Hook 16 + maybe Hook 5 tightening) lets
+  the existing corrupt saves load without losing data.
