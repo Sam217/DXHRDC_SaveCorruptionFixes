@@ -637,3 +637,37 @@ When a new crash signature shows up, the playbook is:
 - **Renaming in Ghidra**: also update the symbol name in this
   document so they stay in sync. Ghidra is the source of truth for
   the database; this file is the human-readable index.
+
+---
+
+## Addendum (2026-05-15)
+
+### Subsystem 9 — Inventory PC On-Disk Serialization Format
+The PC `zlib` stream serializes inventory items into a dynamic, variable-length block. The offset shifts based on preceding data size (e.g., `0x1A9000` to `0x124000`).
+The exact structural layout (minimum 20 bytes per instance) was verified via diffing identical saves with single-item consumption:
+- `+0x00` (4 bytes): Item ID (Little-Endian `uint32`). E.g., Painkillers = `6A 26 00 00` (`0x266A`).
+- `+0x04` (2 bytes): Flag / Status (`uint16 LE`). Usually `1`.
+- `+0x06` (2 bytes): Item Count (`uint16 LE`).
+- `+0x08` (4 bytes): Grid X Position (`uint32 LE`).
+- `+0x0C` (4 bytes): Grid Y Position (`uint32 LE`).
+- `+0x10` (4 bytes): Rotation/Status state (`int32 LE`). E.g., `-217`.
+
+*(Engine loot-tables and vendors default to `Pos(0,0)` with `Count=1000`. These must be filtered out during forensic analysis).*
+
+### The `saveindex` File
+The game engine enforces a strict master index file (`remote/saveindex`) containing an array of 53-byte records per save slot. If the index is missing, the engine regenerates it on launch. If the index exists but a save file's size or CRC32 mismatches its record, the engine throws a "Cannot Load" error.
+
+**53-byte Record Layout:**
+- `+0x00` (32 bytes): Null-padded ASCII filename (e.g., `GAMER1_4\0\0...`).
+- `+0x20` (4 bytes): Compressed file size in bytes (`uint32 LE`).
+- `+0x24` (8 bytes): Windows `FILETIME` timestamp (`uint64 LE`).
+- `+0x2C` (4 bytes): Unknown/Flag.
+- `+0x30` (4 bytes): `zlib` stream CRC32 Checksum (`uint32 LE`).
+
+### The Writer-Side Root Cause (Hook 16 implementation)
+The runaway writer bug (Bug A) occurs inside `cdc::InstanceTable::SaveToStream` (RVA `0x000ECC00`). 
+The function reads `*(uint*)(this+0x14)` to determine how many instances to serialize. When memory corruption points this field to an uninitialized stack address, it reads a garbage integer (e.g., `45,000,000`), allocating a massive array and serializing ~35KB of uninitialized memory directly into the save stream.
+
+This massive garbage block pushes all subsequent valid world-state data backward, fundamentally desynchronizing the loader's read pointer. This is why surgical zeroing fails: the pointer remains desynced. The stream must be perfectly realigned by deleting the garbage and padding the file tail.
+
+**Hook 16 (`version_proxy.c`)** intercepts `SaveToStream`, validates `*(uint*)(this+0x14)`, and clamps it to `0` if it exceeds `50,000` or sits in a stack/heap range, fully mitigating the writer bug.

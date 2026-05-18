@@ -1739,3 +1739,54 @@ my job is to read bytes faithfully.
   regions (raw bytes + byte-class) and the area-name field framing.
   Use it before relying on any prior claim in this document.
 
+---
+
+## 11.12 The Final Breakthrough: PC Format & Serialization Stream Resync (2026-05-15)
+
+In this session, we conclusively solved the remaining mysteries surrounding the save files, decoded the PC inventory serialization format, and developed a definitive fix for corrupted saves.
+
+### 11.12.1 Decoding the PC Inventory Format
+We abandoned the outdated Xbox 360 byte-patterns. By creating two identical saves (`GAMER1_4` and `GAMER2_4`) with a single difference (consuming 1 Painkiller), a simple binary diff revealed the exact PC inventory serialization structure.
+
+The format is a variable-length stream (minimum 20 bytes per item instance):
+- `[0..3]` : 4-byte LE Item ID (e.g., `6A 26 00 00` = `0x266A` = Painkillers)
+- `[4..5]` : 2-byte LE Flag (usually `1`)
+- `[6..7]` : 2-byte LE Count (`uint16`)
+- `[8..11]` : 4-byte LE Grid X position (UI coordinate)
+- `[12..15]`: 4-byte LE Grid Y position (UI coordinate)
+- `[16..19]`: 4-byte LE Rotation/Status state (signed `int32`)
+
+This discovery proved that **the runaway writer does not overwrite the physical items in the binary.** The items (even the user's hacked stack of 20 painkillers) survived in the corrupted `GAMER5_4` save. The corruption destroys the *UI pointer index* that tells the HUD where they are.
+
+### 11.12.2 The "saveindex" File & CRC32
+Attempts to manually repack zlib saves (`.dec` -> `.4`) failed to load because the game engine enforces strict validation via a master `saveindex` file.
+The `saveindex` contains a 53-byte record for each save:
+- 32-byte null-padded filename string
+- 4-byte LE Compressed File Size
+- 8-byte LE `FILETIME`
+- 4-byte LE Unknown/Flag
+- **4-byte LE CRC32 Checksum** of the compressed save data.
+
+We updated our Python tooling (`save_repair_tool.py --mode=pack`) to automatically recalculate the `zlib` stream's CRC32 and file size, and inject them into `saveindex`. Repacked saves now load flawlessly.
+
+### 11.12.3 The Dynamic Shift Theory (Stream Desync)
+The surgical zero-patch (`--mode=patch`) failed to restore the UI because PC saves are dynamically serialized streams. 
+
+When the runaway writer dumps ~35KB of uninitialized stack memory into the file, it doesn't just overwrite existing data; it **inserts** that 35KB into the stream, pushing all subsequent valid world-state data (quest logs, map states, etc.) 35KB deeper into the file. (Verified by observing a `0x32100` byte offset shift for identical items between saves).
+
+Zeroing the garbage leaves the engine's read-pointer desynchronized. When `LoadFromStream` reads 0 items, it attempts to read the next object block immediately, but the next block has been pushed away by the garbage padding.
+
+**The Ultimate Repair (`--mode=shift`):**
+To perfectly resync the stream:
+1. Locate the ~35KB garbage block.
+2. Clamp the corrupted 4-byte "Count" header immediately preceding it to `0`.
+3. Physically **delete** the 35KB garbage block.
+4. Shift the entire remaining file backward to resync the read pointer.
+5. Append 35KB of zeros to the end of the file to satisfy the engine's strict `DECOMP_SIZE` requirement.
+This restores stream alignment, allowing the game to load the rest of the world state correctly and unlocking the in-game debug menu to manually restore lost items.
+
+### 11.12.4 Tools Added
+- **Hook 16 (`version_proxy.c`):** Implemented an inline hook on `cdc::InstanceTable::SaveToStream` (RVA `0x000ECC00`). It checks `*(uint*)(this+0x14)` before serialization. If the count exceeds `MAX_INSTANCES` (50,000) or falls into uninitialized stack/heap address ranges, it clamps the count to 0, permanently preventing the runaway writer from corrupting new saves.
+- **Python Save Editor GUI (`pythonSaveRepair/gui.py`):** A full Tkinter-based visual editor. It unpacks/packs saves, automatically patches `saveindex` CRC32s, reads XP/Praxis, and lists the user's inventory with exact hex offsets for easy HxD surgery.
+- **`save_repair_tool.py` updates:** Added `--mode=unpack`, `--mode=pack`, and the definitive `--mode=shift`. Updated `INVENTORY_ITEMS` with verified 4-byte LE PC IDs.
+
