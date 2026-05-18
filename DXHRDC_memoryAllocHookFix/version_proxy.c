@@ -1631,6 +1631,64 @@ static int __fastcall Hook_RestoreInstance(void *this_, void *edx_,
 }
 
 /* ================================================================
+ * 9m. HOOK 16 — cdc::InstanceTable::SaveToStream (Preventive Validator)
+ *
+ * RVA 0x000ecc00   __thiscall   void (uint *stream)
+ *
+ * This hook prevents runaway writers from corrupting new saves.
+ * It reads the instance count `*(uint*)(this + 0x14)`. If the count
+ * is impossibly large (> MAX_INSTANCES) OR resides in the stack
+ * or heap range (uninitialized data leak), it clamps the count to 0
+ * in memory before calling the original SaveToStream. This prevents
+ * the original function from serializing garbage indices and overflowing
+ * the stream.
+ *
+ * Prologue (8 bytes stolen — two complete instructions):
+ *   000ecc00  8B 44 24 04          MOV EAX,dword ptr [ESP + 0x4]
+ *   000ecc04  80 78 0C 00          CMP byte ptr [EAX + 0xc],0x0
+ * ================================================================ */
+
+#define RVA_SAVESTREAM 0x000ecc00
+#define STEAL_SAVESTREAM 8
+
+static HookCtx g_hkSaveStream;
+static volatile LONG g_saveStreamCatches = 0;
+
+typedef void(__fastcall *OrigSaveStream_t)(void *this_, void *edx_, unsigned int *stream);
+
+static void __fastcall Hook_SaveToStream(void *this_, void *edx_, unsigned int *stream)
+{
+	unsigned int count = *(unsigned int *)((char *)this_ + 0x14);
+
+	/* Check if count is garbage:
+	 * > MAX_INSTANCES (50000)
+	 * OR is in stack range ~0x02000000 - 0x0FFFFFFF
+	 * OR is in heap range ~0x10000000 - 0x1FFFFFFF
+	 */
+	if (count > MAX_INSTANCES || 
+		(count >= 0x02000000 && count <= 0x0FFFFFFF) || 
+		(count >= 0x10000000 && count <= 0x1FFFFFFF))
+	{
+		LONG n = InterlockedIncrement(&g_saveStreamCatches);
+		if (n <= 20)
+		{
+			DWORD ra = (DWORD)(DWORD_PTR)_ReturnAddress();
+			BYTE *base = (BYTE *)GetModuleHandleA(NULL);
+			Log("[MEMFIX] SaveToStream: caught garbage count %u "
+					"(0x%08X) before save! Clamping to 0. "
+					"(catch #%ld, RA=0x%08X = RVA 0x%08X)\r\n",
+					count, count, n, (unsigned)ra, (unsigned)(ra - (DWORD)(DWORD_PTR)base));
+		}
+		
+		/* Clamp it to 0 so the original function writes an empty array instead of crashing/corrupting */
+		*(unsigned int *)((char *)this_ + 0x14) = 0;
+	}
+
+	OrigSaveStream_t orig = (OrigSaveStream_t)(g_hkSaveStream.trampoline);
+	orig(this_, edx_, stream);
+}
+
+/* ================================================================
  * 10. HOOK INSTALLATION
  * ================================================================ */
 
@@ -2159,6 +2217,34 @@ static BOOL InstallAllHooks(void)
 		} else
 		{
 			Log("[MEMFIX] [OK] Hooked cdc::InstanceTable::RestoreInstance (SEH wrap)\r\n");
+		}
+	}
+
+	/* Hook 16: cdc::InstanceTable::SaveToStream — Validator.
+	 * This prevents writing corrupted saves by clamping uninitialized/huge
+	 * instance counts to 0 before they are serialized. */
+	BYTE *pSaveStream = base + RVA_SAVESTREAM;
+	LogBytes("SaveToStream   ", pSaveStream, 16);
+
+	if (pSaveStream[0] != 0x8B || pSaveStream[1] != 0x44 ||
+			pSaveStream[2] != 0x24 || pSaveStream[3] != 0x04 ||
+			pSaveStream[4] != 0x80 || pSaveStream[5] != 0x78 ||
+			pSaveStream[6] != 0x0C || pSaveStream[7] != 0x00)
+	{
+		Log("[MEMFIX] WARNING: SaveToStream prologue mismatch! "
+				"Expected 8B 44 24 04 80 78 0C 00, got %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+				pSaveStream[0], pSaveStream[1], pSaveStream[2], pSaveStream[3],
+				pSaveStream[4], pSaveStream[5], pSaveStream[6], pSaveStream[7]);
+		Log("[MEMFIX]   Hook 16 SKIPPED\r\n");
+	} else
+	{
+		if (!InstallHook(&g_hkSaveStream, pSaveStream,
+										 (void *)Hook_SaveToStream, STEAL_SAVESTREAM))
+		{
+			Log("[MEMFIX] FAILED to hook SaveToStream\r\n");
+		} else
+		{
+			Log("[MEMFIX] [OK] Hooked cdc::InstanceTable::SaveToStream (Preventive Validator)\r\n");
 		}
 	}
 

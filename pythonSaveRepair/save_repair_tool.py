@@ -54,6 +54,7 @@ from collections import Counter
 # Default in-repo locations (junction -> Steam userdata).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+# print(f"Repo root: {REPO_ROOT}")
 DEFAULT_SAVES_DIR = os.path.join(REPO_ROOT, "238010", "remote")
 
 # Decompressed PC save size (matches engine's FUN_001ac850(0x23A000)).
@@ -89,7 +90,7 @@ DEFAULT_TOP_N = 20
 # show 42-56% zero, 0-22% printable. The %FF axis is NOT distinctive —
 # normal world state has 3-7% FF too — so we only detect Signature A.
 ANOMALY_WINDOW = 0x800   # 2 KB
-ANOMALY_STEP   = 0x400   # 1 KB (50% overlap)
+ANOMALY_STEP = 0x400   # 1 KB (50% overlap)
 RUNAWAY_ZERO_LO, RUNAWAY_ZERO_HI = 22.0, 30.0
 RUNAWAY_PRINT_LO, RUNAWAY_PRINT_HI = 22.0, 30.0
 
@@ -103,57 +104,63 @@ SAVE_FILE_RE = re.compile(r"^GAME[RAQ]\d+_4$")
 # praxis = BE int32 at (offset - 8). The editor finds 4 redundant copies.
 XP_PRAXIS_MAGIC = bytes.fromhex("00012D7500012D8300012D7B")
 
-# Inventory items: (3-byte hex ID, friendly name).
-# Extracted from form1.cs SearchString calls (lines 7683-8738 for upgraded
-# patterns *0101, lines 8776-9831 for normal patterns *01). Each item has
-# both variants in the editor but the 3-byte ID is the same.
-# Layout per record (9 bytes):
-#   [0..2]: ID (3 bytes BE)
-#   [3]:    0x01
-#   [4]:    0x01 if upgraded, 0x00 if normal
-#   [5..6]: count (BE uint16)
-#   [7..8]: 0x00 0x00
+# PC Inventory items: (4-byte hex ID LE, friendly name).
+# Inferred from differential analysis of PC saves.
+# Record layout (minimum 20 bytes):
+#   [0..3]: ID (4 bytes LE)
+#   [4..5]: Flag (2 bytes LE, usually 1)
+#   [6..7]: count (2 bytes LE uint16)
+#   [8..11]: Grid X (4 bytes LE)
+#   [12..15]: Grid Y (4 bytes LE)
+#   [16..19]: Rotation / Status (4 bytes LE signed int)
 INVENTORY_ITEMS = [
-    ("001F51", "Painkillers"),
-    ("001F08", "Nuke_Virus_Software"),
-    ("002056", "Stop_Worm_Software"),
-    ("004C25", "PEPS_Energy_Pack"),
-    ("004A40", "Typhoon_Ammo"),
-    ("0020CE", "Tranquilizer_Darts"),
-    ("00243A", "Combat_Rifle_Ammo"),
-    ("001F8A", "Shotgun_Cartridges"),
-    ("00036A", "10mm_Pistol_Ammo"),
-    ("008364", "Laser_Rifle_Battery"),
-    ("008363", "Plasma_Capsules"),
-    ("00DD22", "Golden_Phoenix_Sling"),
-    ("004572", "Machine_Pistol_Ammo"),
-    ("00DD21", "Shanghai_Gu_Punch"),
-    ("00B6FA", "Auto_Hacker"),
-    ("00036C", "Concussion_Mine"),
-    ("00DD20", "Slum_Dog"),
-    ("001034", "Fragmentation_Mine"),
-    ("005187", "Gas_Mine"),
-    ("004BD3", "EMP_Grenade"),
-    ("003D21", "Ammo_Capacity"),
-    ("0020C8", "Stun_Gun_Darts"),
-    ("004A68", "Mine_Template"),
-    ("010614", "Spirits"),
-    ("00239C", "HypoStim"),
-    ("00D544", "Whiskey"),
-    ("004DF0", "Gas_Grenade"),
-    ("002A56", "Beer_2"),
-    ("0047C9", "Revolver_Ammo"),
-    ("0024BD", "Sniper_Rifle_Ammo"),
-    ("001F3C", "CyberBoost_ProEnergy_Bar"),
-    ("001F36", "CyberBoost_ProEnergy_Pack"),
-    ("003D90", "Rockets"),
-    ("01176F", "Wine_2"),
-    ("009350", "Vodka"),
-    ("00AD25", "Wine"),
-    ("00C484", "CyberBoost_ProEnergy_Jar"),
-    ("0048D2", "Heavy_Rifle_Ammo"),
-    ("010337", "Beer"),
-    ("001F83", "Crossbow_Arrows"),
+    ("6a260000", "Painkillers"),
+    ("e52c0000", "CyberBoost_ProEnergy"),
+    ("a3c20000", "Automatic_Unlocking_Device"),
+    ("72210000", "Combat_Rifle_Ammo"),
+    ("49290000", "Combat_Rifle"),
+    ("019a0000", "Tranquilizer_Gun"),
+    ("f11e0000", "Pistol_Silenced"),
+    ("0b2c0100", "Alcohol/Vodka"), # Found at (12,6) in GAMER51_4
+    ("d0250000", "Nuke_Virus_Software"),
+    ("6e260000", "Stop_Worm_Software"),
+    ("a54b0000", "PEPS_Energy_Pack"),
+    ("a44a0000", "Typhoon_Ammo"),
+    ("ce200000", "Tranquilizer_Darts"),
+    ("3a240000", "Combat_Rifle_Ammo_Old"),
+    ("8a1f0000", "Shotgun_Cartridges"),
+    ("6a030000", "10mm_Pistol_Ammo"),
+    ("64830000", "Laser_Rifle_Battery"),
+    ("63830000", "Plasma_Capsules"),
+    ("22dd0000", "Golden_Phoenix_Sling"),
+    ("72450000", "Machine_Pistol_Ammo"),
+    ("21dd0000", "Shanghai_Gu_Punch"),
+    ("fab60000", "Auto_Hacker_Old"),
+    ("6c030000", "Concussion_Mine"),
+    ("20dd0000", "Slum_Dog"),
+    ("34100000", "Fragmentation_Mine"),
+    ("87510000", "Gas_Mine"),
+    ("d34b0000", "EMP_Grenade"),
+    ("213d0000", "Ammo_Capacity"),
+    ("c8200000", "Stun_Gun_Darts"),
+    ("684a0000", "Mine_Template"),
+    ("14060100", "Spirits"),
+    ("9c230000", "HypoStim"),
+    ("44d50000", "Whiskey"),
+    ("f04d0000", "Gas_Grenade"),
+    ("562a0000", "Beer_2"),
+    ("c9470000", "Revolver_Ammo"),
+    ("bd240000", "Sniper_Rifle_Ammo"),
+    ("3c1f0000", "CyberBoost_ProEnergy_Bar"),
+    ("361f0000", "CyberBoost_ProEnergy_Pack"),
+    ("903d0000", "Rockets"),
+    ("6f170100", "Wine_2"),
+    ("50930000", "Vodka"),
+    ("25ad0000", "Wine"),
+    ("84c40000", "CyberBoost_ProEnergy_Jar"),
+    ("d2480000", "Heavy_Rifle_Ammo"),
+    ("37030100", "Beer"),
+    ("831f0000", "Crossbow_Arrows"),
 ]
 
 
@@ -208,7 +215,8 @@ def hybrid_graft(broken: bytes, working: bytes, boundary: int) -> bytes:
 def diff_summary(a: bytes, b: bytes, label_a: str, label_b: str) -> None:
     """Print a quick byte-diff summary between two equal-length buffers."""
     if len(a) != len(b):
-        print(f"  size mismatch: {label_a}={len(a):#x} vs {label_b}={len(b):#x}")
+        print(
+            f"  size mismatch: {label_a}={len(a):#x} vs {label_b}={len(b):#x}")
         return
     n = sum(1 for x, y in zip(a, b) if x != y)
     print(
@@ -263,8 +271,8 @@ def _hex_ctx(buf: bytes, off: int, before: int = 8, after: int = 12) -> str:
     """Render hex bytes around `off`, bracketing the 4 bytes at `off`."""
     a = max(0, off - before)
     b = min(len(buf), off + 4 + after)
-    pre  = buf[a:off].hex(" ")
-    cur  = buf[off:off+4].hex(" ")
+    pre = buf[a:off].hex(" ")
+    cur = buf[off:off+4].hex(" ")
     post = buf[off+4:b].hex(" ")
     return f"{pre} [{cur}] {post}"
 
@@ -280,27 +288,32 @@ def print_scan_detail(buf: bytes, name: str, summary: dict, top_n: int, chunk_si
         ("HEAP",  HEAP_RANGE,  "heap"),
     ):
         hits = summary[key]
-        in_prog  = sum(1 for off, _ in hits if off <  boundary)
+        in_prog = sum(1 for off, _ in hits if off < boundary)
         in_world = sum(1 for off, _ in hits if off >= boundary)
         print()
         print(f"  {label}-range uint32s ({lo:#010x} - {hi:#010x}):")
         print(f"    total hits           : {len(hits)}")
-        print(f"    in progression header: {in_prog}  (offset < {boundary:#x})")
-        print(f"    in world state       : {in_world}  (offset >= {boundary:#x})")
+        print(
+            f"    in progression header: {in_prog}  (offset < {boundary:#x})")
+        print(
+            f"    in world state       : {in_world}  (offset >= {boundary:#x})")
         if not hits:
             continue
 
         by_chunk = Counter((off // chunk_size) * chunk_size for off, _ in hits)
-        print(f"    per-chunk counts (chunk size {chunk_size:#x}, only chunks with hits):")
+        print(
+            f"    per-chunk counts (chunk size {chunk_size:#x}, only chunks with hits):")
         for chunk_off in sorted(by_chunk):
             region = "PROG " if chunk_off < boundary else "WORLD"
-            print(f"      {chunk_off:#08x}  [{region}]  hits: {by_chunk[chunk_off]}")
+            print(
+                f"      {chunk_off:#08x}  [{region}]  hits: {by_chunk[chunk_off]}")
 
         n = min(top_n, len(hits))
         print(f"    top {n} candidates by offset:")
         for off, v in hits[:n]:
             region = "PROG " if off < boundary else "WORLD"
-            print(f"      [{off:#08x} {region}] val={v:#010x}  ctx: {_hex_ctx(buf, off)}")
+            print(
+                f"      [{off:#08x} {region}] val={v:#010x}  ctx: {_hex_ctx(buf, off)}")
 
 
 def find_all(buf: bytes, needle: bytes):
@@ -368,24 +381,37 @@ def read_progression(buf: bytes) -> dict:
 
     items = []
     for id_hex, name in INVENTORY_ITEMS:
-        upg_pat = bytes.fromhex(id_hex + "0101")
-        norm_pat = bytes.fromhex(id_hex + "01")
-        # Try upgraded first (5 bytes); falls back to normal (4 bytes) since
-        # the upgraded record's first 4 bytes also match the normal pattern.
-        off = buf.find(upg_pat)
-        if off >= 0:
-            status = "upg"
-        else:
-            off = buf.find(norm_pat)
-            status = "norm" if off >= 0 else "abs"
-        if off < 0 or off + 7 > len(buf):
+        id_bytes = bytes.fromhex(id_hex)
+        hits = list(find_all(buf, id_bytes))
+
+        if not hits:
             items.append({"id": id_hex, "name": name,
                           "status": "abs", "count": None, "off": None})
             continue
-        items.append({"id": id_hex, "name": name, "status": status,
-                      "count": read_be_uint16(buf, off + 5), "off": off})
-    return {"snapshots": snapshots, "items": items}
 
+        for h in hits:
+            if h + 20 > len(buf):
+                continue
+
+            flag = int.from_bytes(buf[h+4:h+6], 'little')
+            count = int.from_bytes(buf[h+6:h+8], 'little')
+            x = int.from_bytes(buf[h+8:h+12], 'little')
+            y = int.from_bytes(buf[h+12:h+16], 'little')
+            rot = int.from_bytes(buf[h+16:h+20], 'little', signed=True)
+
+            # Filter insane coordinates (likely false positive byte matches)
+            if x > 100 or y > 100:
+                continue
+
+            # Filter drop-tables/engine defaults (always at 0,0 with exactly 1000 count)
+            if x == 0 and y == 0 and count == 1000:
+                continue
+                
+            status = f"Pos({x},{y})"
+            items.append({"id": id_hex, "name": name, "status": status,
+                          "count": count, "off": h})
+
+    return {"snapshots": snapshots, "items": items}
 
 def cmd_read(args):
     """Forensic read: XP, praxis, and inventory item counts for one or more saves."""
@@ -412,14 +438,16 @@ def cmd_read(args):
 
     print()
     print("=== XP / Praxis snapshots (BE int32 read at anchor-12 / anchor-8) ===")
-    header = f"{'snapshot':<10}  {'field':<8}  " + "  ".join(f"{n:<{col_w}}" for n, _ in valid)
+    header = f"{'snapshot':<10}  {'field':<8}  " + \
+        "  ".join(f"{n:<{col_w}}" for n, _ in valid)
     print(header)
     print("-" * len(header))
     for snap_label in ("snap1", "snap2", "snap3", "snap4"):
         for field in ("xp", "praxis"):
             row = [f"{snap_label:<10}", f"{field:<8}"]
             for n, r in valid:
-                snap = next((s for s in r["snapshots"] if s["label"] == snap_label), None)
+                snap = next((s for s in r["snapshots"]
+                            if s["label"] == snap_label), None)
                 if snap is None:
                     cell = "—"
                 else:
@@ -429,7 +457,8 @@ def cmd_read(args):
 
     print()
     print("=== Inventory items (count, status: upg=upgraded, norm=normal, —=absent) ===")
-    header = f"{'item':<{name_w}}" + "  ".join(f"{n:<{col_w}}" for n, _ in valid)
+    header = f"{'item':<{name_w}}" + \
+        "  ".join(f"{n:<{col_w}}" for n, _ in valid)
     print(header)
     print("-" * len(header))
     # Sort: present-in-any-save first, then by name for readability.
@@ -455,9 +484,9 @@ def cmd_hybrid(args):
     """Original hybrid-graft experiment. Non-viable per SUMMARY §11.1 but kept
     so the failed result remains reproducible."""
     boundary = int(args.boundary, 0)
-    broken_path  = os.path.join(args.saves_dir, args.broken)
+    broken_path = os.path.join(args.saves_dir, args.broken)
     working_path = os.path.join(args.saves_dir, args.working)
-    output_path  = os.path.join(args.saves_dir, args.output)
+    output_path = os.path.join(args.saves_dir, args.output)
 
     print(f"saves dir : {args.saves_dir}")
     print(f"broken    : {broken_path}")
@@ -470,7 +499,8 @@ def cmd_hybrid(args):
     broken = read_save(broken_path)
     working = read_save(working_path)
     print(f"  broken  decompressed: {len(broken):#x} bytes ({len(broken):,})")
-    print(f"  working decompressed: {len(working):#x} bytes ({len(working):,})")
+    print(
+        f"  working decompressed: {len(working):#x} bytes ({len(working):,})")
     print()
 
     print("Diff overview:")
@@ -512,7 +542,8 @@ def cmd_hybrid(args):
         print("  OK: decompressed output matches hybrid byte-for-byte.")
     else:
         n = sum(1 for x, y in zip(rt, hybrid) if x != y)
-        print(f"  FAIL: roundtrip differs in {n} bytes (CRITICAL — investigate)")
+        print(
+            f"  FAIL: roundtrip differs in {n} bytes (CRITICAL — investigate)")
         sys.exit(1)
 
     print()
@@ -579,6 +610,140 @@ def _finalize_region(windows: list, window_size: int) -> dict:
             "dominant_type": dom, "windows": windows}
 
 
+def cmd_patch(args):
+    """Surgically zero out the anomalous regions (runaway writer corruption)."""
+    boundary = int(args.boundary, 0)
+    name = args.input or args.broken
+    if not name:
+        raise SystemExit("--mode=patch requires --input <save>")
+
+    input_path = os.path.join(args.saves_dir, name)
+    output_name = args.output or f"{name}_patched"
+    output_path = os.path.join(args.saves_dir, output_name)
+
+    print(f"Reading {input_path} for patching...")
+    try:
+        buf = bytearray(read_save(input_path))
+    except Exception as e:
+        raise SystemExit(f"Failed to read save: {e}")
+
+    regions = scan_anomalous_regions(buf, boundary)
+    if not regions:
+        print("No anomalous regions detected. Nothing to patch.")
+        return
+
+    print(f"Detected {len(regions)} anomalous region(s) to zero out:")
+    total_bytes = 0
+    for i, r in enumerate(regions):
+        print(f"  [{i}] {r['start']:#x}..{r['end']:#x} (len={r['length']:,} bytes)")
+        for off in range(r["start"], r["end"]):
+            buf[off] = 0
+        total_bytes += r["length"]
+
+    print(f"Zeroed out {total_bytes:,} total bytes.")
+
+    if args.dry_run:
+        print("DRY RUN — not writing anything.")
+        return
+
+    bak = backup_file(output_path)
+    if bak:
+        print(f"Backed up existing {output_name} -> {os.path.basename(bak)}")
+
+    print(f"Writing patched save -> {output_path}")
+    write_save(output_path, bytes(buf))
+    print("Done.")
+
+
+def cmd_unpack(args):
+    """Decompress a save file to raw binary for external analysis (e.g. HxD)."""
+    name = args.input or args.broken
+    if not name:
+        raise SystemExit("--mode=unpack requires --input <save>")
+
+    input_path = os.path.join(args.saves_dir, name)
+    out_name = args.output or f"{name}.dec"
+    out_path = os.path.join(args.saves_dir, out_name)
+
+    print(f"Reading and decompressing {input_path}...")
+    try:
+        buf = read_save(input_path)
+    except Exception as e:
+        raise SystemExit(f"Failed to read save: {e}")
+
+    with open(out_path, "wb") as f:
+        f.write(buf)
+    print(f"Unpacked {len(buf):,} bytes to {out_path}")
+
+
+def update_saveindex(saves_dir: str, save_name: str, save_path: str) -> bool:
+    """Update the saveindex file with the new file size and CRC32."""
+    index_path = os.path.join(saves_dir, "saveindex")
+    if not os.path.exists(index_path):
+        return False
+
+    with open(index_path, 'rb') as f:
+        data = bytearray(f.read())
+
+    name_bytes = save_name.encode('ascii') + b'\0'
+    pos = data.find(name_bytes)
+    if pos == -1:
+        return False
+
+    new_size = os.path.getsize(save_path)
+    with open(save_path, 'rb') as f:
+        file_data = f.read()
+    new_crc = binascii.crc32(file_data) & 0xFFFFFFFF
+
+    # Structure from start of name:
+    # 32 bytes: null-padded string
+    # 4 bytes: file size
+    # 8 bytes: FILETIME
+    # 4 bytes: unknown
+    # 4 bytes: CRC32
+    size_offset = pos + 32
+    crc_offset = pos + 32 + 4 + 8 + 4
+
+    data[size_offset:size_offset+4] = struct.pack('<I', new_size)
+    data[crc_offset:crc_offset+4] = struct.pack('<I', new_crc)
+
+    with open(index_path, 'wb') as f:
+        f.write(data)
+    return True
+
+
+def cmd_pack(args):
+    """Compress a raw binary file back into a zlib save file and update saveindex."""
+    name = args.input or args.broken
+    if not name:
+        raise SystemExit("--mode=pack requires --input <dec_file>")
+
+    input_path = os.path.join(args.saves_dir, name)
+
+    # Infer the target save name (e.g. GAMER1_4.dec -> GAMER1_4)
+    target_name = name.replace(".dec", "")
+    out_name = args.output or target_name
+    out_path = os.path.join(args.saves_dir, out_name)
+
+    print(f"Reading raw binary {input_path}...")
+    try:
+        with open(input_path, "rb") as f:
+            buf = f.read()
+    except Exception as e:
+        raise SystemExit(f"Failed to read file: {e}")
+
+    print(f"Compressing and writing to {out_path}...")
+    write_save(out_path, buf)
+
+    # The game requires saveindex to reflect exact file size and CRC32
+    if update_saveindex(args.saves_dir, out_name, out_path):
+        print(f"Updated saveindex for {out_name}.")
+    else:
+        print(f"Warning: Could not update saveindex for {out_name}.")
+
+    print("Done.")
+
+
 def cmd_scan_anomalies(args):
     """Byte-class anomaly scanner (Phase A1, take 2)."""
     boundary = int(args.boundary, 0)
@@ -588,7 +753,8 @@ def cmd_scan_anomalies(args):
         if not files:
             print(f"No save files matched in {args.saves_dir}")
             return
-        print(f"Scanning {len(files)} saves for byte-class anomalies in {args.saves_dir}")
+        print(
+            f"Scanning {len(files)} saves for byte-class anomalies in {args.saves_dir}")
         print(f"World-state start : {boundary:#x}")
         print(f"Window/step       : {ANOMALY_WINDOW}/{ANOMALY_STEP} bytes")
         print(f"Signature A       : %zero in [{RUNAWAY_ZERO_LO:.0f}, {RUNAWAY_ZERO_HI:.0f}] AND "
@@ -606,7 +772,8 @@ def cmd_scan_anomalies(args):
             n = len(regions)
             tot = sum(r["length"] for r in regions)
             first = regions[0]["start"] if regions else None
-            types = "".join(sorted({r["dominant_type"] for r in regions})) or "-"
+            types = "".join(sorted({r["dominant_type"]
+                            for r in regions})) or "-"
             rows.append((name, mtime, n, tot, first, types, None))
 
         print("=== cross-save anomaly summary (chronological by mtime) ===")
@@ -622,12 +789,14 @@ def cmd_scan_anomalies(args):
                 continue
             f_str = f"{first:#010x}" if first is not None else "-"
             marker = "  <-- ANOMALY" if n > 0 else ""
-            print(f"{name:<14}  {ts:<19}  {n:>7}  {tot:>9,}  {f_str:>10}  {types}{marker}")
+            print(
+                f"{name:<14}  {ts:<19}  {n:>7}  {tot:>9,}  {f_str:>10}  {types}{marker}")
         return
 
     name = args.input
     if not name:
-        raise SystemExit("--mode=scan-anomalies requires --input <save> or --scan-all")
+        raise SystemExit(
+            "--mode=scan-anomalies requires --input <save> or --scan-all")
     path = os.path.join(args.saves_dir, name)
     print(f"Scanning {path} for byte-class anomalies")
     print(f"World-state start: {boundary:#x}")
@@ -646,9 +815,9 @@ def cmd_scan_anomalies(args):
 
 def cmd_scan(args):
     """Scan one or all saves for stack/heap-range uint32 hits."""
-    boundary   = int(args.boundary, 0)
+    boundary = int(args.boundary, 0)
     chunk_size = int(args.chunk_size, 0)
-    top_n      = args.top_n
+    top_n = args.top_n
 
     if args.scan_all:
         files = sorted(list_save_files(args.saves_dir), key=lambda x: x[2])
@@ -666,14 +835,15 @@ def cmd_scan(args):
             try:
                 buf = read_save(path)
             except (ValueError, zlib.error) as e:
-                rows.append((name, mtime, None, None, None, None, None, str(e)))
+                rows.append((name, mtime, None, None,
+                            None, None, None, str(e)))
                 continue
             s = scan_buffer_summary(buf, boundary)
             stack_total = len(s["stack"])
             stack_world = sum(1 for off, _ in s["stack"] if off >= boundary)
-            stack_prog  = stack_total - stack_world
-            heap_total  = len(s["heap"])
-            heap_world  = sum(1 for off, _ in s["heap"] if off >= boundary)
+            stack_prog = stack_total - stack_world
+            heap_total = len(s["heap"])
+            heap_world = sum(1 for off, _ in s["heap"] if off >= boundary)
             rows.append((name, mtime, stack_total, stack_prog, stack_world,
                          heap_total, heap_world, None))
 
@@ -697,7 +867,8 @@ def cmd_scan(args):
         detailed = [(n, p, m) for (n, p, m), r in zip(files, rows)
                     if r[2] is not None and r[2] > 0]
         if detailed and not args.summary_only:
-            print(f"=== per-save detail for {len(detailed)} saves with stack hits ===")
+            print(
+                f"=== per-save detail for {len(detailed)} saves with stack hits ===")
             for name, path, _ in detailed:
                 try:
                     buf = read_save(path)
@@ -724,18 +895,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode",
-                    choices=("hybrid", "scan", "scan-anomalies", "read"),
+                    choices=("hybrid", "scan",
+                             "scan-anomalies", "read", "patch"),
                     default="hybrid",
                     help="hybrid: graft progression+worldstate (legacy). "
                          "scan: read-only stack/heap-range uint32 hits (falsified). "
                          "scan-anomalies: detect runaway-writer byte-class signature. "
-                         "read: forensic XP/praxis/inventory readout for comparison.")
+                         "read: forensic XP/praxis/inventory readout for comparison. "
+                         "patch: surgically zero out anomalous regions.")
     ap.add_argument("--saves-dir", default=DEFAULT_SAVES_DIR,
                     help=f"folder containing GAMER##_4 files "
-                         f"(default: {DEFAULT_SAVES_DIR})")
+                    f"(default: {DEFAULT_SAVES_DIR})")
     ap.add_argument("--boundary", default=hex(DEFAULT_BOUNDARY),
                     help=f"progression/world-state split offset "
-                         f"(default: {DEFAULT_BOUNDARY:#x})")
+                    f"(default: {DEFAULT_BOUNDARY:#x})")
     ap.add_argument("--dry-run", action="store_true",
                     help="hybrid: show diffs but don't write")
 
@@ -773,6 +946,12 @@ def main():
         cmd_scan_anomalies(args)
     elif args.mode == "read":
         cmd_read(args)
+    elif args.mode == "patch":
+        cmd_patch(args)
+    elif args.mode == "unpack":
+        cmd_unpack(args)
+    elif args.mode == "pack":
+        cmd_pack(args)
 
 
 if __name__ == "__main__":
