@@ -610,6 +610,72 @@ def _finalize_region(windows: list, window_size: int) -> dict:
             "dominant_type": dom, "windows": windows}
 
 
+def cmd_shift(args):
+    """Delete the anomalous regions and shift the file to resync the serialization stream."""
+    boundary = int(args.boundary, 0)
+    name = args.input or args.broken
+    if not name:
+        raise SystemExit("--mode=shift requires --input <save>")
+    
+    input_path = os.path.join(args.saves_dir, name)
+    output_name = args.output or f"{name}_shifted"
+    output_path = os.path.join(args.saves_dir, output_name)
+
+    print(f"Reading {input_path} for stream resync...")
+    try:
+        buf = bytearray(read_save(input_path))
+    except Exception as e:
+        raise SystemExit(f"Failed to read save: {e}")
+
+    regions = scan_anomalous_regions(buf, boundary)
+    if not regions:
+        print("No anomalous regions detected. Nothing to shift.")
+        return
+
+    print(f"Detected {len(regions)} anomalous region(s):")
+    total_deleted = 0
+    
+    # Process regions in reverse order so deleting doesn't mess up earlier offsets
+    for i, r in reversed(list(enumerate(regions))):
+        start = r["start"]
+        end = r["end"]
+        length = r["length"]
+        
+        # The 4 bytes right before the garbage is the corrupted 'Count' header.
+        # We clamp it to 0 so LoadFromStream expects exactly 0 items.
+        if start >= 4:
+            count_offset = start - 4
+            old_count = int.from_bytes(buf[count_offset:start], 'little')
+            print(f"  [{i}] Corrupted Count Header at {hex(count_offset)}: {old_count} -> clamping to 0")
+            buf[count_offset:start] = b'\x00\x00\x00\x00'
+
+        print(f"  [{i}] Deleting {length:,} bytes from {start:#x}..{end:#x}")
+        del buf[start:end]
+        total_deleted += length
+
+    print(f"Deleted {total_deleted:,} bytes of garbage. Appending zeros to maintain {DECOMP_SIZE:#x} file size...")
+    buf.extend(b'\x00' * total_deleted)
+
+    if len(buf) != DECOMP_SIZE:
+        print(f"ERROR: Final size is {len(buf):#x}, expected {DECOMP_SIZE:#x}")
+        return
+
+    if args.dry_run:
+        print("DRY RUN — not writing anything.")
+        return
+
+    bak = backup_file(output_path)
+    if bak:
+        print(f"Backed up existing {output_name} -> {os.path.basename(bak)}")
+    
+    print(f"Writing resynced save -> {output_path}")
+    write_save(output_path, bytes(buf))
+    
+    if update_saveindex(args.saves_dir, output_name, output_path):
+        print(f"Updated saveindex for {output_name}.")
+        
+    print("Done.")
+
 def cmd_patch(args):
     """Surgically zero out the anomalous regions (runaway writer corruption)."""
     boundary = int(args.boundary, 0)
@@ -952,6 +1018,8 @@ def main():
         cmd_unpack(args)
     elif args.mode == "pack":
         cmd_pack(args)
+    elif args.mode == "shift":
+        cmd_shift(args)
 
 
 if __name__ == "__main__":

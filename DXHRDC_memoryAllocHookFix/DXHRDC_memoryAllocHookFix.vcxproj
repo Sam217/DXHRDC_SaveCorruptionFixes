@@ -61,6 +61,10 @@
       <EnableUAC>false</EnableUAC>
       <ModuleDefinitionFile>version.def</ModuleDefinitionFile>
     </Link>
+    <PostBuildEvent>
+      <Command>copy /Y "$(OutDir)version.dll" "E:\Steam HRY\steamapps\common\Deus Ex Human Revolution Director's Cut"
+copy /Y "$(OutDir)version.pdb" "E:\Steam HRY\steamapps\common\Deus Ex Human Revolution Director's Cut"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
