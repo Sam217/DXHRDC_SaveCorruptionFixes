@@ -16,7 +16,7 @@ class DXHRSaveEditor(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Deus Ex: HR Director's Cut - Save Editor/Forensics")
-        self.geometry("800x600")
+        self.geometry("1100x650")
         self.current_file = None
         self.buf = None
         
@@ -55,16 +55,19 @@ class DXHRSaveEditor(tk.Tk):
         
         tk.Label(right_frame, text="Inventory Items (Detected)", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
         
-        cols = ("Name", "ID", "Count", "X", "Y", "Offset")
+        cols = ("Name", "ID", "Count", "X", "Y", "Flag", "Offset", "Sec", "Extra")
         self.inv_tree = ttk.Treeview(right_frame, columns=cols, show="headings")
         for c in cols:
             self.inv_tree.heading(c, text=c)
         self.inv_tree.column("Name", width=180)
         self.inv_tree.column("ID", width=80)
-        self.inv_tree.column("Count", width=60, anchor=tk.E)
-        self.inv_tree.column("X", width=50, anchor=tk.E)
-        self.inv_tree.column("Y", width=50, anchor=tk.E)
+        self.inv_tree.column("Count", width=50, anchor=tk.E)
+        self.inv_tree.column("X", width=35, anchor=tk.E)
+        self.inv_tree.column("Y", width=35, anchor=tk.E)
+        self.inv_tree.column("Flag", width=40, anchor=tk.E)
         self.inv_tree.column("Offset", width=80)
+        self.inv_tree.column("Sec", width=30, anchor=tk.CENTER)
+        self.inv_tree.column("Extra", width=200)
         
         scrollbar = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=self.inv_tree.yview)
         self.inv_tree.configure(yscroll=scrollbar.set)
@@ -160,26 +163,56 @@ class DXHRSaveEditor(tk.Tk):
             snap = prog["snapshots"][0] # Just show the first one
             self.stats_tree.insert("", tk.END, text="XP", values=(snap.get("xp", "N/A"),))
             self.stats_tree.insert("", tk.END, text="Praxis", values=(snap.get("praxis", "N/A"),))
+
+        # Show inventory section count in stats
+        sections = prog.get("inventory_sections", [])
+        self.stats_tree.insert("", tk.END, text="Inv Sections", values=(len(sections),))
+        for i, sec in enumerate(sections):
+            self.stats_tree.insert("", tk.END, text=f"  Sec {i} hdr",
+                                   values=(f"0x{sec['header_off']:08X}",))
+            self.stats_tree.insert("", tk.END, text=f"  Sec {i} items",
+                                   values=(sec["item_count"],))
             
-        # Populate Inventory
+        # Populate Inventory — grouped by section
         for item in prog["items"]:
-            if item["status"] != "abs":
-                x = "?"
-                y = "?"
-                if item["status"].startswith("Pos("):
-                    parts = item["status"][4:-1].split(",")
-                    x = parts[0]
-                    y = parts[1]
-                
-                self.inv_tree.insert("", tk.END, values=(
-                    item["name"], 
-                    item["id"], 
-                    item["count"], 
-                    x, 
-                    y, 
-                    hex(item["off"]) if item["off"] else ""
-                ))
+            sec_idx = item.get("section", "?")
+            extra_hex = item.get("extra", b"")
+            if isinstance(extra_hex, bytes):
+                # Show non-zero extra as compact hex, or empty
+                if any(b != 0 for b in extra_hex):
+                    extra_str = extra_hex.hex(' ')
+                else:
+                    extra_str = ""
+            else:
+                extra_str = str(extra_hex)
+
+            # Parse pos from status string
+            status = item.get("status", "")
+            x, y = "?", "?"
+            if status.startswith("Pos("):
+                parts = status[4:-1].split(",")
+                x = parts[0]
+                y = parts[1]
+            
+            self.inv_tree.insert("", tk.END, values=(
+                item["name"], 
+                item["id"], 
+                item.get("count", ""),
+                x,
+                y,
+                item.get("flag", ""),
+                hex(item["off"]) if item.get("off") else "",
+                sec_idx,
+                extra_str,
+            ))
+
+        n_items = len(prog["items"])
+        self.status_var.set(
+            f"Loaded: {os.path.basename(self.current_file)} | "
+            f"{len(sections)} inventory section(s), {n_items} total items"
+        )
 
 if __name__ == "__main__":
     app = DXHRSaveEditor()
     app.mainloop()
+

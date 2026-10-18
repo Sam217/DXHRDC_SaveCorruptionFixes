@@ -116,65 +116,60 @@ XP_PRAXIS_MAGIC = bytes.fromhex("00012D7500012D8300012D7B")
 INVENTORY_ITEMS = [
     ("6a260000", "Painkillers"),
     ("e52c0000", "CyberBoost_ProEnergy"),
-    ("a3c20000", "Automatic_Unlocking_Device"),
+    ("58260000", "CyberBoost_ProEnergy_Pack"),
+    ("1b4d0000", "CyberBoost_ProEnergy_Jar"),
+    ("0b2c0100", "Vodka"),
+    ("a3c20000", "Auto_Unlock_Device"),
+    ("b92c0000", "Nuke_Virus"),
+    ("f42d0000", "Stop_Worm"),
+    ("49290000", "FR27_Auto_Rifle_Silenced"),
+    ("14ff0000", "Grenade_Launcher"),
+    ("f11e0000", "10mm_Pistol_Upgraded"),
+    ("019a0000", "Tranquilizer_Rifle_Upgraded"),
     ("72210000", "Combat_Rifle_Ammo"),
-    ("49290000", "Combat_Rifle"),
-    ("019a0000", "Tranquilizer_Gun"),
-    ("f11e0000", "Pistol_Silenced"),
-    ("0b2c0100", "Alcohol/Vodka"), # Found at (12,6) in GAMER51_4
-    ("d0250000", "Nuke_Virus_Software"),
-    ("6e260000", "Stop_Worm_Software"),
-    ("a54b0000", "PEPS_Energy_Pack"),
-    ("a44a0000", "Typhoon_Ammo"),
-    ("ce200000", "Tranquilizer_Darts"),
-    ("3a240000", "Combat_Rifle_Ammo_Old"),
-    ("8a1f0000", "Shotgun_Cartridges"),
-    ("6a030000", "10mm_Pistol_Ammo"),
-    ("64830000", "Laser_Rifle_Battery"),
-    ("63830000", "Plasma_Capsules"),
-    ("22dd0000", "Golden_Phoenix_Sling"),
-    ("72450000", "Machine_Pistol_Ammo"),
-    ("21dd0000", "Shanghai_Gu_Punch"),
-    ("fab60000", "Auto_Hacker_Old"),
-    ("6c030000", "Concussion_Mine"),
-    ("20dd0000", "Slum_Dog"),
-    ("34100000", "Fragmentation_Mine"),
-    ("87510000", "Gas_Mine"),
-    ("d34b0000", "EMP_Grenade"),
-    ("213d0000", "Ammo_Capacity"),
-    ("c8200000", "Stun_Gun_Darts"),
-    ("684a0000", "Mine_Template"),
-    ("14060100", "Spirits"),
-    ("9c230000", "HypoStim"),
-    ("44d50000", "Whiskey"),
-    ("f04d0000", "Gas_Grenade"),
-    ("562a0000", "Beer_2"),
-    ("c9470000", "Revolver_Ammo"),
-    ("bd240000", "Sniper_Rifle_Ammo"),
-    ("3c1f0000", "CyberBoost_ProEnergy_Bar"),
-    ("361f0000", "CyberBoost_ProEnergy_Pack"),
-    ("903d0000", "Rockets"),
-    ("6f170100", "Wine_2"),
-    ("50930000", "Vodka"),
-    ("25ad0000", "Wine"),
-    ("84c40000", "CyberBoost_ProEnergy_Jar"),
-    ("d2480000", "Heavy_Rifle_Ammo"),
-    ("37030100", "Beer"),
-    ("831f0000", "Crossbow_Arrows"),
+    ("335f0000", "Typhoon_Ammo"),
+    ("6c2e0000", "Tranquilizer_Darts"),
+    ("08ff0000", "Grenade_Launcher_Ammo"),
+    ("fc050000", "10mm_Pistol_Ammo"),
+    ("3d290000", "Ammo_Upgrade"),
+    ("68600000", "Laser_Targeting_Upgrade"),
+    ("cb1c0000", "Sticky_Mine"),
+    ("fd050000", "Frag_Grenade"),
+    ("fe050000", "Flash_Bang"),
+    ("e0590000", "EMP_Grenade"),
+    ("df590000", "EMP_Mine"),
+    ("a3720000", "Remote_Detonated_Explosive"),
 ]
+
+# Inventory section header: [u32 gridWidth=14] [u32 gridHeight=7] [u16 itemCount]
+# followed by itemCount x 40-byte records.  Validated across all 100+ save files.
+# The header floats to different offsets per save (variable-length stream).
+INVENTORY_HEADER = b"\x0e\x00\x00\x00\x07\x00\x00\x00"  # u32(14) + u32(7)
+INVENTORY_RECORD_SIZE = 40  # 0x28 bytes per item
+INVENTORY_GRID_WIDTH = 14
+INVENTORY_GRID_HEIGHT = 7
+
+# Reverse lookup: item ID (int) -> friendly name
+INVENTORY_ID_TO_NAME = {}
+for _hex, _name in INVENTORY_ITEMS:
+    _id_val = int.from_bytes(bytes.fromhex(_hex), 'little')
+    INVENTORY_ID_TO_NAME[_id_val] = _name
 
 
 def read_save(path: str) -> bytes:
-    """Read and zlib-decompress a save file. Validate decompressed size."""
+    """Read a save file (zlib-compressed or raw .dec). Validate decompressed size."""
     with open(path, "rb") as f:
-        compressed = f.read()
+        raw = f.read()
+    # Already decompressed?  Accept it directly.
+    if len(raw) == DECOMP_SIZE:
+        return raw
     # PC saves should start with zlib magic 78 9C.
-    if len(compressed) < 2 or compressed[:2] != b"\x78\x9c":
+    if len(raw) < 2 or raw[:2] != b"\x78\x9c":
         raise ValueError(
-            f"{path}: not a zlib-compressed PC save "
-            f"(first 2 bytes: {compressed[:2].hex() if compressed else 'empty'})"
+            f"{path}: not a zlib-compressed PC save and not a raw .dec "
+            f"(size={len(raw):#x}, first 2 bytes: {raw[:2].hex() if raw else 'empty'})"
         )
-    decompressed = zlib.decompress(compressed)
+    decompressed = zlib.decompress(raw)
     if len(decompressed) != DECOMP_SIZE:
         raise ValueError(
             f"{path}: decompressed size {len(decompressed):#x} "
@@ -337,8 +332,112 @@ def read_be_uint16(buf: bytes, off: int) -> int:
     return struct.unpack_from(">H", buf, off)[0]
 
 
+def find_inventory_sections(buf: bytes) -> list:
+    """Find all inventory sections in a decompressed save buffer.
+
+    Searches for the inventory header pattern:
+        [u32 gridWidth=14] [u32 gridHeight=7] [u16 itemCount]
+    followed by itemCount x 40-byte item records.
+
+    Returns a list of dicts, each shaped like:
+      {
+        "header_off": int,       # offset of the header (gridWidth field)
+        "items_off": int,        # offset of first item record
+        "item_count": int,       # number of items
+        "grid_width": int,       # always 14
+        "grid_height": int,      # always 7
+        "items": [
+          {
+            "item_id": int,      # raw item ID
+            "id_hex": str,       # 4-byte LE hex string
+            "name": str,         # friendly name or "Unknown_0xXXXX"
+            "flag": int,         # usually 1 or 257
+            "count": int,        # stack count
+            "pos_x": int,        # grid column (0-13)
+            "pos_y": int,        # grid row (0-6)
+            "rotation": int,     # rotation / sort-order state
+            "extra": bytes,      # 20 bytes of upgrade/attachment data
+            "off": int,          # absolute offset in the buffer
+          }, ...
+        ],
+      }
+    """
+    sections = []
+    pos = 0
+    while True:
+        idx = buf.find(INVENTORY_HEADER, pos)
+        if idx < 0:
+            break
+
+        # Read u16 item count immediately after the 8-byte header
+        count_off = idx + 8
+        if count_off + 2 > len(buf):
+            pos = idx + 1
+            continue
+
+        item_count = struct.unpack_from("<H", buf, count_off)[0]
+
+        # Sanity: count must be reasonable (0-500) and data must fit
+        items_off = count_off + 2  # first item record
+        end_off = items_off + item_count * INVENTORY_RECORD_SIZE
+        if item_count > 500 or end_off > len(buf):
+            pos = idx + 1
+            continue
+
+        # Validate: at least the first item should look plausible
+        if item_count > 0:
+            flag0 = struct.unpack_from("<H", buf, items_off + 4)[0]
+            px0 = struct.unpack_from("<I", buf, items_off + 8)[0]
+            py0 = struct.unpack_from("<I", buf, items_off + 12)[0]
+            if flag0 not in (0, 1, 257) or px0 >= 20 or py0 >= 10:
+                pos = idx + 1
+                continue
+
+        # Parse all item records
+        items = []
+        for i in range(item_count):
+            rec_off = items_off + i * INVENTORY_RECORD_SIZE
+            item_id = struct.unpack_from("<I", buf, rec_off)[0]
+            flag    = struct.unpack_from("<H", buf, rec_off + 4)[0]
+            count   = struct.unpack_from("<H", buf, rec_off + 6)[0]
+            px      = struct.unpack_from("<I", buf, rec_off + 8)[0]
+            py      = struct.unpack_from("<I", buf, rec_off + 12)[0]
+            rot     = struct.unpack_from("<i", buf, rec_off + 16)[0]
+            extra   = buf[rec_off + 20 : rec_off + INVENTORY_RECORD_SIZE]
+
+            id_hex = buf[rec_off:rec_off+4].hex()
+            name = INVENTORY_ID_TO_NAME.get(item_id, f"Unknown_0x{item_id:04X}")
+
+            items.append({
+                "item_id": item_id,
+                "id_hex": id_hex,
+                "name": name,
+                "flag": flag,
+                "count": count,
+                "pos_x": px,
+                "pos_y": py,
+                "rotation": rot,
+                "extra": extra,
+                "off": rec_off,
+            })
+
+        sections.append({
+            "header_off": idx,
+            "items_off": items_off,
+            "item_count": item_count,
+            "grid_width": INVENTORY_GRID_WIDTH,
+            "grid_height": INVENTORY_GRID_HEIGHT,
+            "items": items,
+        })
+
+        # Skip past this section to find the next one
+        pos = end_off
+
+    return sections
+
+
 def read_progression(buf: bytes) -> dict:
-    """Read XP/praxis snapshots and inventory item counts from a decompressed save.
+    """Read XP/praxis snapshots and inventory sections from a decompressed save.
 
     Returns a dict shaped like:
       {
@@ -346,10 +445,14 @@ def read_progression(buf: bytes) -> dict:
           {"label": "snap1", "anchor_off": int, "xp": int, "praxis": int},
           ... up to 4 entries (some may be missing)
         ],
+        "inventory_sections": [
+          { ... section dict from find_inventory_sections() ... },
+        ],
         "items": [
-          {"id": "001F51", "name": "Painkillers", "status": "upg" | "norm" | "abs",
-           "count": int | None, "off": int | None},
-          ... 40 entries
+          {"id": str, "name": str, "status": str,
+           "count": int, "off": int, "flag": int,
+           "rotation": int, "extra": bytes, "section": int},
+          ...
         ],
       }
     """
@@ -379,39 +482,31 @@ def read_progression(buf: bytes) -> dict:
             "praxis": read_be_int32(buf, px_off),
         })
 
+    # Use header-based inventory detection
+    inv_sections = find_inventory_sections(buf)
+
+    # Flatten items for backward-compatible "items" list,
+    # tagging each with its section index.
     items = []
-    for id_hex, name in INVENTORY_ITEMS:
-        id_bytes = bytes.fromhex(id_hex)
-        hits = list(find_all(buf, id_bytes))
+    for sec_idx, sec in enumerate(inv_sections):
+        for item in sec["items"]:
+            items.append({
+                "id": item["id_hex"],
+                "name": item["name"],
+                "status": f"Pos({item['pos_x']},{item['pos_y']})",
+                "count": item["count"],
+                "off": item["off"],
+                "flag": item["flag"],
+                "rotation": item["rotation"],
+                "extra": item["extra"],
+                "section": sec_idx,
+            })
 
-        if not hits:
-            items.append({"id": id_hex, "name": name,
-                          "status": "abs", "count": None, "off": None})
-            continue
-
-        for h in hits:
-            if h + 20 > len(buf):
-                continue
-
-            flag = int.from_bytes(buf[h+4:h+6], 'little')
-            count = int.from_bytes(buf[h+6:h+8], 'little')
-            x = int.from_bytes(buf[h+8:h+12], 'little')
-            y = int.from_bytes(buf[h+12:h+16], 'little')
-            rot = int.from_bytes(buf[h+16:h+20], 'little', signed=True)
-
-            # Filter insane coordinates (likely false positive byte matches)
-            if x > 100 or y > 100:
-                continue
-
-            # Filter drop-tables/engine defaults (always at 0,0 with exactly 1000 count)
-            if x == 0 and y == 0 and count == 1000:
-                continue
-                
-            status = f"Pos({x},{y})"
-            items.append({"id": id_hex, "name": name, "status": status,
-                          "count": count, "off": h})
-
-    return {"snapshots": snapshots, "items": items}
+    return {
+        "snapshots": snapshots,
+        "inventory_sections": inv_sections,
+        "items": items,
+    }
 
 def cmd_read(args):
     """Forensic read: XP, praxis, and inventory item counts for one or more saves."""
